@@ -62,7 +62,26 @@ public:
     // World position of a humanoid bone in the current pose (or origin if missing).
     Vec3 bonePosition(const std::string& bone) const;
 
+    // ---- Low-level node access (used by the spring-bone simulation).
+    int nodeCount() const { return static_cast<int>(world_.size()); }
+    const Mat4& nodeWorld(int n) const { return world_[n]; }
+    const Quat& nodeWorldRotation(int n) const { return worldR_[n]; }
+    Quat parentWorldRotation(int n) const {
+        int p = model_.nodes[n].parent;
+        return p < 0 ? rootRot_ : worldR_[p];
+    }
+    const Quat& restLocalRotation(int n) const { return restR_[n]; }
+    const Vec3& restLocalTranslation(int n) const { return restT_[n]; }
+    const Mat4& restWorld(int n) const { return restWorld_[n]; }
+    // Sets a node's world rotation (keeps its local translation) and updates its subtree.
+    void setNodeWorldRotation(int n, const Quat& q) { setWorldRotation(n, q); }
+
+    // Morph-target weights per mesh, [mesh][target] in 0..1 (facial expressions).
+    std::vector<std::vector<float>>& morphWeights() { return morphWeights_; }
+    const std::vector<std::vector<float>>& morphWeights() const { return morphWeights_; }
+
 private:
+    std::vector<std::vector<float>> morphWeights_;
     const Model& model_;
     float scale_ = 1.0f;
     RestMetrics rest_;

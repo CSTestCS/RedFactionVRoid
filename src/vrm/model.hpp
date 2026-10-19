@@ -20,6 +20,12 @@ struct Node {
     int skin = -1;
 };
 
+// Morph target (blend shape) deltas, used by facial expressions.
+struct MorphTarget {
+    std::vector<Vec3> dPos;   // per vertex
+    std::vector<Vec3> dNrm;   // per vertex (may be empty)
+};
+
 struct Primitive {
     std::vector<Vec3> positions;
     std::vector<Vec3> normals;      // may be empty -> computed on load
@@ -28,11 +34,49 @@ struct Primitive {
     std::vector<float> weights;     // 4 per vertex
     std::vector<uint32_t> indices;  // triangle list
     int material = -1;
+    std::vector<MorphTarget> targets;
 };
 
 struct Mesh {
     std::string name;
     std::vector<Primitive> primitives;
+    std::vector<float> defaultWeights;  // one per morph target
+};
+
+// ---- Facial expressions (VRM 1.0 names; VRM 0.x presets are renamed on load).
+struct ExpressionBind {
+    int mesh = -1;
+    int morph = -1;
+    float weight = 1.0f;  // 0..1
+};
+enum class OverrideMode { None, Block, Blend };
+struct Expression {
+    std::string name;     // "happy", "blink", "aa", custom names ...
+    bool preset = false;
+    std::vector<ExpressionBind> binds;
+    bool binary = false;
+    OverrideMode overrideBlink = OverrideMode::None;
+    OverrideMode overrideMouth = OverrideMode::None;
+};
+
+// ---- Spring bones (hair, skirts, accessories).
+struct SpringCollider {
+    int node = -1;
+    Vec3 offset;          // in node space
+    float radius = 0;
+    bool capsule = false;
+    Vec3 tail;            // capsule end, node space
+};
+struct SpringJoint {
+    int node = -1;
+    int tailNode = -1;            // child the bone points at, or -1 for a virtual tail
+    Vec3 virtualTail;             // node-space tail position when tailNode < 0
+    float hitRadius = 0.02f;
+    float stiffness = 1.0f;
+    float gravityPower = 0.0f;
+    Vec3 gravityDir{0, -1, 0};
+    float dragForce = 0.4f;
+    std::vector<int> colliderGroups;
 };
 
 struct Skin {
@@ -117,6 +161,16 @@ struct Model {
     std::vector<Texture> textures;
     std::vector<Material> materials;
     std::map<std::string, int> humanoid;  // humanoid bone name -> node index
+    std::vector<Expression> expressions;
+    std::vector<SpringCollider> colliders;
+    std::vector<std::vector<int>> colliderGroups;  // indices into colliders
+    std::vector<SpringJoint> springJoints;          // parents before children
+
+    int findExpression(const std::string& name) const {
+        for (size_t i = 0; i < expressions.size(); ++i)
+            if (expressions[i].name == name) return static_cast<int>(i);
+        return -1;
+    }
 
     int humanBone(const std::string& name) const {
         auto it = humanoid.find(name);

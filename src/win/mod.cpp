@@ -119,7 +119,8 @@ void Mod::loadConfig() {
     cfg_.loadString(kDefaultConfig);  // defaults first ...
     Ini user;
     if (user.loadFile(path)) {        // ... then the user's file overrides key by key
-        for (const char* sec : {"General", "Scale", "Menu", "Render", "GameSkeleton", "BoneMap", "GameCamera", "GamePause", "GameHide", "DrawFilter"})
+        for (const char* sec : {"General", "Scale", "Menu", "Render", "Physics", "Expressions", "GameSkeleton", "BoneMap", "GameCamera",
+                                "GamePause", "GameHide", "DrawFilter", "GameState", "GameLighting"})
             for (auto& kv : user.section(sec)) cfg_.set(sec, kv.first, kv.second);
     }
     state_ = Ini();
@@ -207,6 +208,8 @@ void Mod::requestLoad(const std::string& path) {
         try {
             la->model = std::make_unique<vrm::Model>(vrm::loadFile(path));
             la->avatar = std::make_unique<vrm::Avatar>(*la->model);
+            la->springs = std::make_unique<vrm::SpringSystem>(*la->avatar);
+            la->expressions = std::make_unique<vrm::ExpressionController>(*la->model, GetTickCount() | 1u);
             la->images.resize(la->model->images.size());
             for (size_t i = 0; i < la->model->images.size(); ++i) {
                 std::string e;
@@ -265,6 +268,13 @@ void Mod::takePending() {
     }
     active_ = std::move(p);
     skinEnabled_ = true;
+    if (active_->expressions) {
+        active_->expressions->setAutoBlink(cfg_.getBool("Expressions", "AutoBlink", true));
+        std::string face = state_.get("State", "Expression", cfg_.get("Expressions", "Default", "neutral"));
+        active_->expressions->setBase(active_->expressions->has(face) ? face : "neutral");
+    }
+    RFV_LOG("Avatar features: %zu spring bones, %zu colliders, %zu expressions", active_->model->springJoints.size(),
+            active_->model->colliders.size(), active_->model->expressions.size());
     std::string name = active_->model->meta.title.empty() ? fileStem(active_->path) : active_->model->meta.title;
     status_ = "ACTIVE: " + upper(name);
     statusIsError_ = false;
@@ -381,10 +391,26 @@ void Mod::onPresent(IDXGISwapChain* sc) {
     auto events = input::poll(mouse);
     handleInput(events, mouse);
 
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    frameDt_ = lastFrameTime_ ? static_cast<float>(double(now.QuadPart - lastFrameTime_) / double(freq.QuadPart)) : 0.0f;
+    lastFrameTime_ = now.QuadPart;
+
     bool canReplace = skinEnabled_ && active_ && poseValid_ && cameraValid_;
     if (active_) {
         active_->avatar->setScale(avatarScale());
-        if (poseValid_) active_->avatar->applySource(pose_, cfg_.getBool("Render", "GroundFeet", true));
+        if (poseValid_ && !panelOpen_) {
+            active_->avatar->applySource(pose_, cfg_.getBool("Render", "GroundFeet", true));
+            if (active_->springs && cfg_.getBool("Physics", "Enabled", true)) {
+                float strength = cfg_.getFloat("Physics", "Wind", 0.0f);
+                active_->springs->setExternalForce(Vec3{strength, 0, strength * 0.3f} *
+                                                   (0.6f + 0.4f * std::sin(static_cast<float>(now.QuadPart / double(freq.QuadPart)) * 1.7f)));
+                // While the game is paused the world is frozen, so freeze the hair too.
+                active_->springs->update(pause_.state() == PauseTracker::State::Running ? frameDt_ : 0.0f);
+            }
+        }
+        updateFace();
     }
     draws::setHidingEnabled(canReplace);
     if (binding_.hasHideWrites()) binding_.applyHide(processMemory(), canReplace);
@@ -475,6 +501,23 @@ void Mod::captureIfRequested(IDXGISwapChain* sc) {
     back->Release();
 }
 
+void Mod::updateFace() {
+    if (!active_ || !active_->expressions) return;
+    vrm::ExpressionController& ec = *active_->expressions;
+    // React to Mason being hurt / near death, if his health is configured.
+    float h = binding_.hasHealth() ? binding_.readHealth(processMemory()) : -1.0f;
+    if (h >= 0) {
+        float maxCfg = cfg_.getFloat("GameState", "HealthMax", 0);
+        healthMax_ = maxCfg > 0 ? maxCfg : std::max(healthMax_, h);
+        if (lastHealth_ >= 0 && h < lastHealth_ - 0.001f * std::max(healthMax_, 1.0f))
+            ec.trigger(cfg_.get("Expressions", "Hurt", "angry"), 0.6f);
+        float lowFrac = cfg_.getFloat("Expressions", "LowHealthFraction", 0.25f);
+        if (healthMax_ > 0 && h > 0 && h < healthMax_ * lowFrac) ec.trigger(cfg_.get("Expressions", "LowHealth", "sad"), 0.2f, 0.7f);
+        lastHealth_ = h;
+    }
+    ec.update(frameDt_, active_->avatar->morphWeights());
+}
+
 void Mod::drawWorldAvatar(ID3D11RenderTargetView* rtv) {
     AvatarDrawParams p;
     p.viewProj = camera_.proj * camera_.view;
@@ -490,6 +533,55 @@ void Mod::drawWorldAvatar(ID3D11RenderTargetView* rtv) {
     if (dm == "standard" || dm == "reversed") {
         gameDepth = acquireCapturedDepth();
         if (gameDepth) p.depth = dm == "reversed" ? AvatarDrawParams::Depth::GameReversed : AvatarDrawParams::Depth::GameStandard;
+    }
+
+    // Lighting from the scene around Mason (and the sun, if its location in memory is known).
+    if (toLower(cfg_.get("Render", "Lighting", "scene")) == "scene") {
+        ID3D11Resource* res = nullptr;
+        rtv->GetResource(&res);
+        ID3D11Texture2D* back = nullptr;
+        if (res && SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back)))) {
+            if (avatarR_.captureScene(ctx_, back)) {
+                p.sceneLighting = true;
+                Mat4 vp = camera_.proj * camera_.view;
+                auto project = [&](const Vec3& g, float& sx, float& sy) {
+                    float cx = vp.at(0, 0) * g.x + vp.at(0, 1) * g.y + vp.at(0, 2) * g.z + vp.at(0, 3);
+                    float cy = vp.at(1, 0) * g.x + vp.at(1, 1) * g.y + vp.at(1, 2) * g.z + vp.at(1, 3);
+                    float cw = vp.at(3, 0) * g.x + vp.at(3, 1) * g.y + vp.at(3, 2) * g.z + vp.at(3, 3);
+                    if (cw < 0.01f) return false;
+                    sx = cx / cw * 0.5f + 0.5f;
+                    sy = 0.5f - cy / cw * 0.5f;
+                    return true;
+                };
+                Mat4 toGame = binding_.avatarToGame();
+                Vec3 chest = toGame.transformPoint(active_->avatar->bonePosition(vrm::bones::Hips) * 0.4f +
+                                                   active_->avatar->bonePosition(vrm::bones::Head) * 0.6f);
+                Vec3 right{camera_.view.at(0, 0), camera_.view.at(0, 1), camera_.view.at(0, 2)};
+                float ax, ay, bx, by;
+                if (project(chest, ax, ay) && project(chest + right * 1.0f, bx, by)) {
+                    p.sceneCenterUv[0] = std::clamp(ax, 0.0f, 1.0f);
+                    p.sceneCenterUv[1] = std::clamp(ay, 0.0f, 1.0f);
+                    float pxPerMetre = std::fabs(bx - ax) * bbW_;
+                    p.sceneRadiusPx = std::clamp(pxPerMetre * cfg_.getFloat("Render", "SceneRadius", 1.5f), 24.0f, bbH_ * 0.5f);
+                }
+                Mat4 nv = camera_.view * toGame;
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c) p.normalToView[r][c] = nv.at(r, c);
+                p.exposure = cfg_.getFloat("Render", "SceneExposure", 2.0f);
+                p.minBright = cfg_.getFloat("Render", "SceneMinBrightness", 0.22f);
+                p.maxBright = cfg_.getFloat("Render", "SceneMaxBrightness", 1.25f);
+                p.saturation = cfg_.getFloat("Render", "SceneSaturation", 0.45f);
+                Vec3 sunDir, sunCol;
+                if (binding_.readSun(processMemory(), sunDir, sunCol)) {
+                    p.lightDir = sunDir;
+                    p.lightColor[0] = sunCol.x; p.lightColor[1] = sunCol.y; p.lightColor[2] = sunCol.z;
+                } else {
+                    p.lightColor[0] = p.lightColor[1] = p.lightColor[2] = 1.0f;  // colour comes from the scene
+                }
+            }
+            back->Release();
+        }
+        if (res) res->Release();
     }
     avatarR_.draw(ctx_, *active_->avatar, p, rtv, gameDepth);
     if (gameDepth) gameDepth->Release();
@@ -542,26 +634,58 @@ void Mod::closePanel() {
 
 void Mod::refreshFiles() { files_ = listVrmFiles(); }
 
-int Mod::panelItemCount() const { return static_cast<int>(files_.size()) + 4; }
+int Mod::faceItemIndex() const {
+    // Only offered when the avatar has at least one expression besides "neutral".
+    bool usable = active_ && skinEnabled_ && active_->expressions && active_->expressions->selectable().size() > 1;
+    return usable ? static_cast<int>(files_.size()) + 1 : -1;
+}
+
+int Mod::panelItemCount() const { return static_cast<int>(files_.size()) + 4 + (faceItemIndex() >= 0 ? 1 : 0); }
 
 std::string Mod::panelItemLabel(int i) const {
     if (i == 0) return "MASON (NO SKIN)";
     int n = static_cast<int>(files_.size());
     if (i <= n) return upper(fileStem(files_[i - 1]));
-    if (i == n + 1) return "BROWSE FOR A .VRM FILE...";
-    if (i == n + 2) return "OPEN VRM FOLDER";
+    int face = faceItemIndex();
+    if (i == face) {
+        std::string b = active_->expressions->base();
+        return "FACE:  < " + upper(b.empty() ? "neutral" : b) + " >";
+    }
+    int k = i - n - (face >= 0 ? 1 : 0);
+    if (k == 1) return "BROWSE FOR A .VRM FILE...";
+    if (k == 2) return "OPEN VRM FOLDER";
     return "BACK";
+}
+
+void Mod::cycleFace(int dir) {
+    if (!active_ || !active_->expressions) return;
+    auto opts = active_->expressions->selectable();
+    std::string cur = active_->expressions->base();
+    if (cur.empty()) cur = "neutral";
+    int idx = 0;
+    for (size_t i = 0; i < opts.size(); ++i)
+        if (opts[i] == cur) idx = static_cast<int>(i);
+    int n = static_cast<int>(opts.size());
+    idx = ((idx + dir) % n + n) % n;
+    active_->expressions->setBase(opts[idx]);
+    state_.set("State", "Expression", opts[idx]);
+    saveState();
 }
 
 void Mod::activatePanelItem(int i) {
     int n = static_cast<int>(files_.size());
+    int face = faceItemIndex();
     if (i == 0) disableSkin();
     else if (i <= n) requestLoad(files_[i - 1]);
-    else if (i == n + 1) browseForFile();
-    else if (i == n + 2) {
-        std::wstring dir = widen(vrmDirectory());
-        ShellExecuteW(nullptr, L"explore", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    } else closePanel();
+    else if (i == face) cycleFace(+1);
+    else {
+        int k = i - n - (face >= 0 ? 1 : 0);
+        if (k == 1) browseForFile();
+        else if (k == 2) {
+            std::wstring dir = widen(vrmDirectory());
+            ShellExecuteW(nullptr, L"explore", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        } else closePanel();
+    }
 }
 
 void Mod::browseForFile() {
@@ -624,6 +748,8 @@ void Mod::handleInput(const std::vector<input::Event>& events, const input::Mous
             case Action::PageUp: panelSel_ = std::max(0, panelSel_ - 5); break;
             case Action::PageDown: panelSel_ = std::min(count - 1, panelSel_ + 5); break;
             case Action::Accept: activatePanelItem(panelSel_); break;
+            case Action::Left: if (panelSel_ == faceItemIndex()) cycleFace(-1); break;
+            case Action::Right: if (panelSel_ == faceItemIndex()) cycleFace(+1); break;
             case Action::Back: closePanel(); break;
             case Action::Hotkey: closePanel(); break;
             default: break;
@@ -712,10 +838,11 @@ void Mod::drawPauseEntry() {
 void Mod::drawPreview(ID3D11RenderTargetView* rtv, float x, float y, float w, float h) {
     if (!active_ || !skinEnabled_ || !avatarR_.hasAvatar()) return;
     vrm::Avatar& av = *active_->avatar;
-    previewYaw_ += 0.01f;
+    previewYaw_ += frameDt_ * 0.8f;
     Vec3 f = av.restForward();
     float face = -std::atan2(f.x, f.z);
     av.setRestPose({0, 0, 0}, face + std::sin(previewYaw_) * 0.6f, true);
+    if (active_->springs && cfg_.getBool("Physics", "Enabled", true)) active_->springs->update(frameDt_);
 
     float H = av.rest().height * av.scale();
     float fov = 30.0f * kPi / 180.0f;

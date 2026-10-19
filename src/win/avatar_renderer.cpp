@@ -1,9 +1,11 @@
 #include "avatar_renderer.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "../core/log.hpp"
+#include "../vrm/expression.hpp"
 #include "d3d_hooks.hpp"
 #include "shader_compiler.hpp"
 
@@ -17,7 +19,13 @@ cbuffer Frame : register(b0) {
     float4 LightDir;
     float4 LightColor;
     float4 Ambient;
+    float4 NV0, NV1, NV2;   // rows: avatar-space normal -> view space
+    float4 EnvUv;           // xy = screen uv of the character, zw = sampling radius in uv
+    float4 EnvParams;       // x = scene lighting on, y = exposure, z = min, w = max brightness
+    float4 EnvParams2;      // x = saturation, y = mip for directional light, z = mip for average
 };
+Texture2D SceneTex : register(t2);   // copy of the frame the game rendered (with mips)
+SamplerState SceneSamp : register(s1);
 cbuffer Draw : register(b1) {
     float4x4 World;
     float4 BaseColor;
@@ -78,19 +86,40 @@ PSIn vsMain(VSIn v) {
     return o;
 }
 
+static const float3 LUMA = float3(0.299, 0.587, 0.114);
+
+// Light arriving from the direction a (view-space) normal faces, estimated from the
+// game's own rendered image around the character: what is above him lights him from
+// above, a red wall to his left tints his left side, a dark interior darkens him.
+float3 sceneLight(float3 nAvatar) {
+    float3 nv = normalize(float3(dot(NV0.xyz, nAvatar), dot(NV1.xyz, nAvatar), dot(NV2.xyz, nAvatar)));
+    float2 uv = EnvUv.xy + float2(nv.x, -nv.y) * EnvUv.zw;
+    float3 e = SceneTex.SampleLevel(SceneSamp, uv, EnvParams2.y).rgb;
+    float3 avg = SceneTex.SampleLevel(SceneSamp, EnvUv.xy, EnvParams2.z).rgb;
+    float le = dot(e, LUMA), la = dot(avg, LUMA);
+    float3 hue = lerp(float3(1, 1, 1), e / max(le, 1e-3), EnvParams2.x);
+    float bright = clamp(lerp(la, le, 0.5) * EnvParams.y, EnvParams.z, EnvParams.w);
+    return hue * bright;
+}
+
 float4 psMain(PSIn i, bool front : SV_IsFrontFace) : SV_Target {
     float4 tex = HasTex != 0 ? BaseTex.Sample(Samp, i.uv) : float4(1, 1, 1, 1);
     float4 col = BaseColor * tex;
     if (Emissive.w >= 0) clip(col.a - Emissive.w);
+    float3 n = normalize(i.nrm) * (front ? 1.0 : -1.0);
+    bool scene = EnvParams.x > 0.5;
+    float3 env = scene ? sceneLight(n) : float3(1, 1, 1);
     float3 rgb;
     if (ShadeColor.w > 0.5) {
-        rgb = col.rgb;
+        rgb = col.rgb * (scene ? env : float3(1, 1, 1));
     } else {
-        float3 n = normalize(i.nrm) * (front ? 1.0 : -1.0);
         float ndl = dot(n, normalize(LightDir.xyz));
         float lit = smoothstep(-0.1, 0.15, ndl);
         float3 shade = ShadeColor.rgb * (HasShadeTex != 0 ? ShadeTex.Sample(Samp, i.uv).rgb : tex.rgb);
-        rgb = lerp(shade, col.rgb, lit) * LightColor.rgb + col.rgb * Ambient.rgb;
+        if (scene)
+            rgb = lerp(shade, col.rgb, lit) * env * LightColor.rgb;
+        else
+            rgb = lerp(shade, col.rgb, lit) * LightColor.rgb + col.rgb * Ambient.rgb;
     }
     rgb += Emissive.rgb;
     return float4(saturate(rgb), col.a);
@@ -110,6 +139,10 @@ struct FrameCB {
     float lightDir[4];
     float lightColor[4];
     float ambient[4];
+    float nv[3][4];
+    float envUv[4];
+    float envParams[4];
+    float envParams2[4];
 };
 
 struct DrawCB {
@@ -188,6 +221,12 @@ bool AvatarRenderer::init(ID3D11Device* device, std::string& error) {
     sd.MaxLOD = D3D11_FLOAT32_MAX;
     device_->CreateSamplerState(&sd, &sampler_);
 
+    D3D11_SAMPLER_DESC ss{};
+    ss.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    ss.AddressU = ss.AddressV = ss.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    ss.MaxLOD = D3D11_FLOAT32_MAX;
+    device_->CreateSamplerState(&ss, &sceneSampler_);
+
     D3D11_RASTERIZER_DESC rd{};
     rd.FillMode = D3D11_FILL_SOLID;
     rd.CullMode = D3D11_CULL_BACK;
@@ -247,13 +286,16 @@ bool AvatarRenderer::init(ID3D11Device* device, std::string& error) {
 void AvatarRenderer::shutdown() {
     unload();
     releaseSizeDependent();
-    rel(vs_); rel(ps_); rel(layout_); rel(frameCb_); rel(drawCb_); rel(sampler_);
+    rel(vs_); rel(ps_); rel(layout_); rel(frameCb_); rel(drawCb_); rel(sampler_); rel(sceneSampler_);
     rel(rsCull_); rel(rsNoCull_); rel(bsOpaque_); rel(bsAlpha_); rel(whiteTex_);
     for (int i = 0; i < 3; ++i) { rel(dsWrite_[i]); rel(dsNoWrite_[i]); }
     rel(device_);
 }
 
 void AvatarRenderer::releaseSizeDependent() {
+    rel(sceneSrv_);
+    rel(sceneTex_);
+    sceneW_ = sceneH_ = 0;
     rel(depthDsv_);
     rel(depthTex_);
     depthW_ = depthH_ = 0;
@@ -332,7 +374,22 @@ bool AvatarRenderer::upload(const LoadedAvatar& src, std::string& error) {
                 }
             }
             GpuPrimitive gp;
-            gp.vb = makeBuffer(device_, verts.data(), static_cast<UINT>(verts.size() * sizeof(Vertex)), D3D11_BIND_VERTEX_BUFFER);
+            gp.src = &p;
+            gp.mesh = node.mesh;
+            if (!p.targets.empty()) {
+                // Morphable (face): dynamic vertex buffer, rewritten when expression weights change.
+                gp.baseVerts.assign(reinterpret_cast<const uint8_t*>(verts.data()),
+                                    reinterpret_cast<const uint8_t*>(verts.data() + verts.size()));
+                D3D11_BUFFER_DESC bd{};
+                bd.ByteWidth = static_cast<UINT>(verts.size() * sizeof(Vertex));
+                bd.Usage = D3D11_USAGE_DYNAMIC;
+                bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+                bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                D3D11_SUBRESOURCE_DATA sd{verts.data(), 0, 0};
+                device_->CreateBuffer(&bd, &sd, &gp.vb);
+            } else {
+                gp.vb = makeBuffer(device_, verts.data(), static_cast<UINT>(verts.size() * sizeof(Vertex)), D3D11_BIND_VERTEX_BUFFER);
+            }
             gp.ib = makeBuffer(device_, p.indices.data(), static_cast<UINT>(p.indices.size() * 4), D3D11_BIND_INDEX_BUFFER);
             gp.indexCount = static_cast<UINT>(p.indices.size());
             gp.material = p.material;
@@ -391,6 +448,75 @@ ID3D11ShaderResourceView* AvatarRenderer::textureFor(int ti) const {
     return textures_[img];
 }
 
+bool AvatarRenderer::captureScene(ID3D11DeviceContext* ctx, ID3D11Texture2D* back) {
+    if (!device_ || !back || sceneUnsupported_) return false;
+    D3D11_TEXTURE2D_DESC bd;
+    back->GetDesc(&bd);
+    if (bd.SampleDesc.Count != 1) { sceneUnsupported_ = true; return false; }
+    if (!sceneTex_ || sceneW_ != bd.Width || sceneH_ != bd.Height || sceneFmt_ != bd.Format) {
+        rel(sceneSrv_);
+        rel(sceneTex_);
+        // Typeless back buffers are viewed as UNORM; mip generation needs a filterable format.
+        DXGI_FORMAT view = bd.Format;
+        if (view == DXGI_FORMAT_R8G8B8A8_TYPELESS) view = DXGI_FORMAT_R8G8B8A8_UNORM;
+        else if (view == DXGI_FORMAT_B8G8R8A8_TYPELESS) view = DXGI_FORMAT_B8G8R8A8_UNORM;
+        else if (view == DXGI_FORMAT_R10G10B10A2_TYPELESS) view = DXGI_FORMAT_R10G10B10A2_UNORM;
+        else if (view == DXGI_FORMAT_R16G16B16A16_TYPELESS) view = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        UINT support = 0;
+        if (FAILED(device_->CheckFormatSupport(view, &support)) || !(support & D3D11_FORMAT_SUPPORT_MIP_AUTOGEN)) {
+            RFV_LOG("Scene lighting unavailable: back-buffer format %d cannot generate mips", static_cast<int>(bd.Format));
+            sceneUnsupported_ = true;
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = bd.Width;
+        td.Height = bd.Height;
+        td.MipLevels = 0;
+        td.ArraySize = 1;
+        td.Format = bd.Format;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = view;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = static_cast<UINT>(-1);
+        if (FAILED(device_->CreateTexture2D(&td, nullptr, &sceneTex_)) || FAILED(device_->CreateShaderResourceView(sceneTex_, &sv, &sceneSrv_))) {
+            rel(sceneTex_);
+            sceneUnsupported_ = true;
+            RFV_LOG("Scene lighting unavailable: cannot create the scene texture");
+            return false;
+        }
+        sceneW_ = bd.Width;
+        sceneH_ = bd.Height;
+        sceneFmt_ = bd.Format;
+    }
+    ctx->CopySubresourceRegion(sceneTex_, 0, 0, 0, 0, back, 0, nullptr);
+    ctx->GenerateMips(sceneSrv_);
+    return true;
+}
+
+void AvatarRenderer::updateMorphs(ID3D11DeviceContext* ctx, GpuPrimitive& gp, const std::vector<float>& weights) {
+    bool changed = weights.size() != gp.lastWeights.size();
+    for (size_t i = 0; !changed && i < weights.size(); ++i) changed = std::fabs(weights[i] - gp.lastWeights[i]) > 1e-4f;
+    if (!changed) return;
+    gp.lastWeights = weights;
+    vrm::applyMorphs(*gp.src, weights, morphPos_, morphNrm_);
+    morphVerts_ = gp.baseVerts;
+    auto* v = reinterpret_cast<Vertex*>(morphVerts_.data());
+    size_t n = morphVerts_.size() / sizeof(Vertex);
+    for (size_t i = 0; i < n && i < morphPos_.size(); ++i) {
+        std::memcpy(v[i].pos, &morphPos_[i], 12);
+        if (i < morphNrm_.size()) std::memcpy(v[i].nrm, &morphNrm_[i], 12);
+    }
+    D3D11_MAPPED_SUBRESOURCE map;
+    if (SUCCEEDED(ctx->Map(gp.vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+        std::memcpy(map.pData, morphVerts_.data(), morphVerts_.size());
+        ctx->Unmap(gp.vb, 0);
+    }
+}
+
 void AvatarRenderer::draw(ID3D11DeviceContext* ctx, const vrm::Avatar& avatar, const AvatarDrawParams& p,
                           ID3D11RenderTargetView* rtv, ID3D11DepthStencilView* gameDepth) {
     if (!uploaded_ || &avatar.model() != model_) return;
@@ -437,6 +563,23 @@ void AvatarRenderer::draw(ID3D11DeviceContext* ctx, const vrm::Avatar& avatar, c
     Vec3 l = normalize(p.lightDir);
     fcb.lightDir[0] = l.x; fcb.lightDir[1] = l.y; fcb.lightDir[2] = l.z;
     for (int i = 0; i < 3; ++i) { fcb.lightColor[i] = p.lightColor[i]; fcb.ambient[i] = p.ambient[i]; }
+    bool scene = p.sceneLighting && sceneSrv_;
+    if (scene) {
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) fcb.nv[r][c] = p.normalToView[r][c];
+        float rad = std::max(p.sceneRadiusPx, 8.0f);
+        fcb.envUv[0] = p.sceneCenterUv[0];
+        fcb.envUv[1] = p.sceneCenterUv[1];
+        fcb.envUv[2] = rad / sceneW_;
+        fcb.envUv[3] = rad / sceneH_;
+        fcb.envParams[0] = 1;
+        fcb.envParams[1] = p.exposure;
+        fcb.envParams[2] = p.minBright;
+        fcb.envParams[3] = p.maxBright;
+        fcb.envParams2[0] = p.saturation;
+        fcb.envParams2[1] = std::log2(std::max(rad * 0.5f, 1.0f));  // a few blurry samples across the area
+        fcb.envParams2[2] = std::log2(std::max(rad * 2.0f, 1.0f));  // one average over the whole area
+    }
     updateCb(ctx, frameCb_, fcb);
 
     draws::setInternal(true);
@@ -454,11 +597,17 @@ void AvatarRenderer::draw(ID3D11DeviceContext* ctx, const vrm::Avatar& avatar, c
     ctx->PSSetConstantBuffers(0, 2, cbs);
     ctx->VSSetShaderResources(0, 1, &boneSrv_);
     ctx->PSSetSamplers(0, 1, &sampler_);
+    ID3D11SamplerState* sceneSamp = sceneSampler_;
+    ctx->PSSetSamplers(1, 1, &sceneSamp);
+    ID3D11ShaderResourceView* sceneView = scene ? sceneSrv_ : nullptr;
+    ctx->PSSetShaderResources(2, 1, &sceneView);
 
-    struct Item { const GpuMeshNode* node; const GpuPrimitive* prim; int queue; bool blend; };
+    struct Item { const GpuMeshNode* node; GpuPrimitive* prim; int queue; bool blend; };
     std::vector<Item> items;
-    for (const auto& mn : meshNodes_)
-        for (const auto& gp : mn.prims) {
+    const auto& morphW = avatar.morphWeights();
+    for (auto& mn : meshNodes_)
+        for (auto& gp : mn.prims) {
+            if (!gp.baseVerts.empty() && gp.mesh >= 0 && gp.mesh < static_cast<int>(morphW.size())) updateMorphs(ctx, gp, morphW[gp.mesh]);
             const vrm::Material* mat = (gp.material >= 0 && gp.material < static_cast<int>(model_->materials.size())) ? &model_->materials[gp.material] : nullptr;
             bool blend = mat && mat->alphaMode == vrm::AlphaMode::Blend;
             items.push_back({&mn, &gp, mat ? mat->renderQueueOffset : 0, blend});

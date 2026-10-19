@@ -88,6 +88,10 @@ private:
     Vec3 lastHips_{};
     int stillFrames_ = 0;
     void sampleGame();
+    void updateFace();
+    float frameDt_ = 0;
+    long long lastFrameTime_ = 0;
+    float lastHealth_ = -1, healthMax_ = 0;
     float avatarScale() const;
 
     // ---- hiding Mason
@@ -107,6 +111,8 @@ private:
     void closePanel();
     void refreshFiles();
     int panelItemCount() const;
+    int faceItemIndex() const;
+    void cycleFace(int dir);
     std::string panelItemLabel(int i) const;
     void activatePanelItem(int i);
     void browseForFile();

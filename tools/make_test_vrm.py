@@ -50,7 +50,13 @@ SKELETON = [
     ("rightLowerLeg", "rightUpperLeg", (0, -0.40, 0)),
     ("rightFoot", "rightLowerLeg", (0, -0.40, 0)),
     ("rightToes", "rightFoot", (0, -0.03, 0.12)),
+    # Ponytail behind the head: a spring-bone chain (not humanoid bones).
+    ("hair1", "head", (0, 0.20, -0.13)),
+    ("hair2", "hair1", (0, -0.12, -0.03)),
+    ("hair3", "hair2", (0, -0.12, 0)),
 ]
+NON_HUMAN = {"Root", "hair1", "hair2", "hair3"}
+HEAD_COLLIDER = ((0, 0.10, 0), 0.12)  # offset from head joint, radius
 HEAD_TOP = 0.25  # head box extends this far above the head joint
 HALF = 0.02      # half thickness of bone boxes
 
@@ -98,6 +104,16 @@ def build(version):
     weights += [(1.0, 0, 0, 0)] * len(v)
     indices += [base + i for tri in f for i in tri]
 
+    # Morph targets on the head box: 0 = "blink" (top face down), 1 = "happy" (top face up).
+    head_box = list(range(base, base + len(v)))
+    top_y = max(positions[i][1] for i in head_box)
+    blink_d = [(0, 0, 0)] * len(positions)
+    happy_d = [(0, 0, 0)] * len(positions)
+    for i in head_box:
+        if abs(positions[i][1] - top_y) < 1e-6:
+            blink_d[i] = (0, -0.05, 0)
+            happy_d[i] = (0, 0.03, 0)
+
     skin_joints = list(range(1, len(nodes)))
     ibms = []
     for j in skin_joints:
@@ -138,6 +154,12 @@ def build(version):
     a_ibm = acc(add(b"".join(struct.pack("<16f", *ibms[k:k + 16]) for k in range(0, len(ibms), 16))), 5126,
                 len(skin_joints), "MAT4")
     img_view = add(png_1x1(230, 150, 40))
+    targets = []
+    for deltas in (blink_d, happy_d):
+        tmin = [min(d[k] for d in deltas) for k in range(3)]
+        tmax = [max(d[k] for d in deltas) for k in range(3)]
+        a = acc(add(b"".join(struct.pack("<3f", *d) for d in deltas), 34962), 5126, len(deltas), "VEC3", min=tmin, max=tmax)
+        targets.append({"POSITION": a})
 
     body = {"name": "Body", "mesh": 0, "skin": 0}
     nodes.append(body)
@@ -154,9 +176,9 @@ def build(version):
         "scene": 0,
         "scenes": [{"nodes": [0, mesh_node]}],
         "nodes": nodes,
-        "meshes": [{"name": "Body", "primitives": [{
+        "meshes": [{"name": "Body", "weights": [0, 0], "primitives": [{
             "attributes": {"POSITION": a_pos, "TEXCOORD_0": a_uv, "JOINTS_0": a_j, "WEIGHTS_0": a_w},
-            "indices": a_i, "material": 0}]}],
+            "targets": targets, "indices": a_i, "material": 0}]}],
         "skins": [{"joints": skin_joints, "inverseBindMatrices": a_ibm}],
         "materials": [material],
         "images": [{"name": "tex", "mimeType": "image/png", "bufferView": img_view}],
@@ -165,7 +187,9 @@ def build(version):
         "bufferViews": views,
         "accessors": accessors,
     }
-    human = [n for n in names if n != "Root"]
+    human = [n for n in names if n not in NON_HUMAN]
+    hair = [idx["hair1"], idx["hair2"], idx["hair3"]]
+    coll_off, coll_r = HEAD_COLLIDER
     if version == 1:
         material["extensions"] = {"VRMC_materials_mtoon": {"specVersion": "1.0", "shadeColorFactor": [0.5, 0.3, 0.2]}}
         gltf["extensionsUsed"] = ["VRMC_vrm", "VRMC_materials_mtoon"]
@@ -174,7 +198,22 @@ def build(version):
             "meta": {"name": "Test Avatar 1.0", "authors": ["RedFactionVRoid"], "version": "1",
                      "licenseUrl": "https://vrm.dev/licenses/1.0/"},
             "humanoid": {"humanBones": {n: {"node": idx[n]} for n in human}},
+            "expressions": {
+                "preset": {
+                    "blink": {"morphTargetBinds": [{"node": mesh_node, "index": 0, "weight": 1.0}], "isBinary": False},
+                    "happy": {"morphTargetBinds": [{"node": mesh_node, "index": 1, "weight": 1.0}], "overrideBlink": "block"},
+                },
+                "custom": {"smug": {"morphTargetBinds": [{"node": mesh_node, "index": 1, "weight": 0.5}]}},
+            },
+        }, "VRMC_springBone": {
+            "specVersion": "1.0",
+            "colliders": [{"node": idx["head"], "shape": {"sphere": {"offset": list(coll_off), "radius": coll_r}}}],
+            "colliderGroups": [{"colliders": [0]}],
+            "springs": [{"joints": [{"node": n, "hitRadius": 0.02, "stiffness": 0.5, "gravityPower": 1.0,
+                                     "gravityDir": [0, -1, 0], "dragForce": 0.4} for n in hair],
+                         "colliderGroups": [0]}],
         }}
+        gltf["extensionsUsed"].append("VRMC_springBone")
     else:
         gltf["extensionsUsed"] = ["VRM"]
         gltf["extensions"] = {"VRM": {
@@ -186,6 +225,17 @@ def build(version):
                                     "floatProperties": {"_CullMode": 0, "_BlendMode": 0},
                                     "vectorProperties": {"_Color": [1, 1, 1, 1], "_ShadeColor": [0.5, 0.3, 0.2, 1]},
                                     "textureProperties": {"_MainTex": 0}}],
+            "blendShapeMaster": {"blendShapeGroups": [
+                {"name": "Blink", "presetName": "blink", "binds": [{"mesh": 0, "index": 0, "weight": 100}]},
+                {"name": "Joy", "presetName": "joy", "binds": [{"mesh": 0, "index": 1, "weight": 100}]},
+                {"name": "Smug", "presetName": "unknown", "binds": [{"mesh": 0, "index": 1, "weight": 50}]},
+            ]},
+            "secondaryAnimation": {
+                "boneGroups": [{"stiffiness": 0.5, "gravityPower": 1.0, "gravityDir": {"x": 0, "y": -1, "z": 0},
+                                "dragForce": 0.4, "hitRadius": 0.02, "bones": [hair[0]], "colliderGroups": [0]}],
+                "colliderGroups": [{"node": idx["head"], "colliders": [
+                    {"offset": {"x": coll_off[0], "y": coll_off[1], "z": coll_off[2]}, "radius": coll_r}]}],
+            },
         }}
 
     bin_data = b"".join(bin_parts)
@@ -202,6 +252,9 @@ def build(version):
         "minY": mn[1], "maxY": mx[1], "height": mx[1] - mn[1],
         "headY": world["head"][1], "ankleY": world["leftFoot"][1],
         "humanBones": len(human), "title": "Test Avatar 1.0" if version == 1 else "Test Avatar 0.x",
+        "springJoints": 2 if version == 1 else 3,
+        "headTopVertex": [i for i in head_box if abs(positions[i][1] - top_y) < 1e-6][0],
+        "headCollider": [world["head"][0], world["head"][1] + coll_off[1], world["head"][2]], "headColliderRadius": coll_r,
     }
     return glb, expected
 

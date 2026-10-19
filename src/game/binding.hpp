@@ -52,6 +52,12 @@ public:
     bool readCamera(MemoryAccess& mem, float aspect, CameraState& out);
     // -1 = unknown / not configured, 0 = running, 1 = paused.
     int readPaused(MemoryAccess& mem);
+    // Mason's health (any unit), or a negative value if not configured / unreadable.
+    float readHealth(MemoryAccess& mem);
+    bool hasHealth() const { return !health_.empty(); }
+    // Sun light, if configured: direction towards the sun and colour, in avatar space.
+    bool readSun(MemoryAccess& mem, Vec3& dirToSun, Vec3& color);
+    bool hasSun() const { return !sunDir_.empty(); }
     // Applies (hide=true) or restores (hide=false) the configured memory writes that hide Mason.
     void applyHide(MemoryAccess& mem, bool hide);
 
@@ -89,6 +95,11 @@ private:
     float fovDefault_ = 70.0f;
     float zNear_ = 0.1f, zFar_ = 2000.0f;
     bool reversedZ_ = false;
+
+    PointerPath health_;
+    enum class ValueType { F32, I32, U32, U16, U8 } healthType_ = ValueType::F32;
+    PointerPath sunDir_, sunColor_;
+    bool sunDirPointsToSun_ = true;
 
     PointerPath pauseFlag_;
     int pauseSize_ = 1;

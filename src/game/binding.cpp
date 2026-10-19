@@ -1,5 +1,6 @@
 #include "binding.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 
@@ -104,6 +105,21 @@ void GameBinding::load(const Ini& ini, std::string& errors) {
     zNear_ = ini.getFloat(C, "Near", 0.1f);
     zFar_ = ini.getFloat(C, "Far", 2000.0f);
     reversedZ_ = toLower(ini.get("Render", "DepthMode", "none")) == "reversed";
+
+    // --- Optional game state / lighting
+    health_ = parsePath(ini, "GameState", "Health", errors);
+    {
+        std::string t = toLower(ini.get("GameState", "HealthType", "f32"));
+        if (t == "f32") healthType_ = ValueType::F32;
+        else if (t == "i32") healthType_ = ValueType::I32;
+        else if (t == "u32") healthType_ = ValueType::U32;
+        else if (t == "u16") healthType_ = ValueType::U16;
+        else if (t == "u8") healthType_ = ValueType::U8;
+        else errors += "[GameState] HealthType must be f32/i32/u32/u16/u8\n";
+    }
+    sunDir_ = parsePath(ini, "GameLighting", "SunDirection", errors);
+    sunColor_ = parsePath(ini, "GameLighting", "SunColor", errors);
+    sunDirPointsToSun_ = toLower(ini.get("GameLighting", "SunDirectionMeaning", "toSun")) != "fromsun";
 
     // --- Pause
     const char* P = "GamePause";
@@ -288,6 +304,37 @@ bool GameBinding::readCamera(MemoryAccess& mem, float aspect, CameraState& out) 
     if (fovHorizontal_) rad = 2.0f * std::atan(std::tan(rad * 0.5f) / std::max(aspect, 0.1f));
     out.fovY = rad;
     out.proj = Mat4::perspectiveLH(rad, aspect, zNear_, zFar_, reversedZ_);
+    return true;
+}
+
+float GameBinding::readHealth(MemoryAccess& mem) {
+    uintptr_t a;
+    if (health_.empty() || !health_.resolve(mem, a)) return -1;
+    switch (healthType_) {
+    case ValueType::F32: { float v; return mem.get(a, v) && std::isfinite(v) ? v : -1; }
+    case ValueType::I32: { int32_t v; return mem.get(a, v) ? float(v) : -1; }
+    case ValueType::U32: { uint32_t v; return mem.get(a, v) ? float(v) : -1; }
+    case ValueType::U16: { uint16_t v; return mem.get(a, v) ? float(v) : -1; }
+    case ValueType::U8: { uint8_t v; return mem.get(a, v) ? float(v) : -1; }
+    }
+    return -1;
+}
+
+bool GameBinding::readSun(MemoryAccess& mem, Vec3& dir, Vec3& color) {
+    uintptr_t a;
+    float v[3];
+    if (sunDir_.empty() || !sunDir_.resolve(mem, a) || !mem.read(a, v, sizeof(v))) return false;
+    Vec3 d{v[0], v[1], v[2]};
+    if (!(length(d) > 0.1f && length(d) < 10.0f)) return false;
+    d = normalize(d);
+    if (!sunDirPointsToSun_) d = -d;
+    dir = gameDirToAvatar(d);
+    color = {1, 1, 1};
+    if (!sunColor_.empty() && sunColor_.resolve(mem, a) && mem.read(a, v, sizeof(v))) {
+        Vec3 c{v[0], v[1], v[2]};
+        float mx = std::max(c.x, std::max(c.y, c.z));
+        if (mx > 1e-3f && mx < 1e4f) color = c / mx;  // keep the hue; brightness comes from the scene
+    }
     return true;
 }
 

@@ -14,6 +14,8 @@
 #include "../src/game/binding.hpp"
 #include "../src/game/pointer_path.hpp"
 #include "../src/vrm/avatar.hpp"
+#include "../src/vrm/expression.hpp"
+#include "../src/vrm/spring.hpp"
 #include "../src/vrm/model.hpp"
 
 using namespace rfv;
@@ -139,11 +141,15 @@ static void testPointerPath() {
     CHECK(threw);
 }
 
-static std::map<std::string, double> expectedFor(const std::string& file) {
+static json::Value expectedJson(const std::string& file) {
     std::ifstream in(g_dir + "/expected.json");
     std::stringstream ss;
     ss << in.rdbuf();
-    auto v = json::parse(ss.str())[file];
+    return json::parse(ss.str())[file];
+}
+
+static std::map<std::string, double> expectedFor(const std::string& file) {
+    auto v = expectedJson(file);
     std::map<std::string, double> m;
     for (auto& kv : v.members())
         if (kv.second.isNumber()) m[kv.first] = kv.second.num();
@@ -327,9 +333,161 @@ static void testBinding() {
     mem.putv<uint8_t>(0x60000, 0);
     CHECK(gb.readPaused(mem) == 0);
 
+    // Optional health and sun values.
+    {
+        FakeMemory m2;
+        m2.putv<float>(0x70000, 87.5f);
+        float sun[3] = {0, 2, 2};       // towards the sun, game space (not normalised)
+        float col[3] = {2.0f, 1.0f, 0.5f};
+        m2.put(0x71000, sun, sizeof(sun));
+        m2.put(0x72000, col, sizeof(col));
+        Ini i2;
+        i2.loadString("[GameState]\nHealth=0x70000\n[GameLighting]\nSunDirection=0x71000\nSunColor=0x72000\n");
+        std::string e2;
+        game::GameBinding b2;
+        b2.load(i2, e2);
+        CHECK(e2.empty());
+        CHECK_NEAR(b2.readHealth(m2), 87.5, 1e-6);
+        Vec3 d, c;
+        CHECK(b2.readSun(m2, d, c));
+        CHECK_NEAR(d.y, 0.70710678, 1e-5);
+        CHECK_NEAR(d.z, -0.70710678, 1e-5);  // LH -> RH
+        CHECK_NEAR(c.x, 1.0, 1e-6);
+        CHECK_NEAR(c.z, 0.25, 1e-6);
+    }
+
     // Avatar -> game conversion flips Z back.
     Vec3 g = gb.avatarToGame().transformPoint(sp.joints["head"]);
     CHECK_NEAR(g.z, 0.02, 1e-6);
+}
+
+
+static void testExpressions(const std::string& file, bool v1) {
+    std::printf("  expressions %s\n", file.c_str());
+    vrm::Model model = vrm::loadFile(g_dir + "/" + file);
+    auto exp = expectedFor(file);
+    CHECK(model.meshes.size() == 1 && model.meshes[0].primitives[0].targets.size() == 2);
+    int blink = model.findExpression("blink"), happy = model.findExpression("happy"), smug = model.findExpression(v1 ? "smug" : "Smug");  // 0.x keeps custom names as authored
+    CHECK(blink >= 0 && happy >= 0 && smug >= 0);  // VRM 0.x "joy" is renamed to "happy"
+    if (happy < 0 || smug < 0 || blink < 0) return;
+    CHECK(model.expressions[happy].preset && !model.expressions[smug].preset);
+    CHECK_NEAR(model.expressions[smug].binds[0].weight, 0.5, 1e-6);  // VRM 0.x weights are 0..100
+    CHECK(model.expressions[happy].overrideBlink == (v1 ? vrm::OverrideMode::Block : vrm::OverrideMode::Blend));
+
+    // Morph application moves the head-top vertex.
+    int top = static_cast<int>(exp["headTopVertex"]);
+    const auto& prim = model.meshes[0].primitives[0];
+    std::vector<Vec3> pos, nrm;
+    CHECK(vrm::applyMorphs(prim, {1.0f, 0.0f}, pos, nrm));
+    CHECK_NEAR(pos[top].y - prim.positions[top].y, -0.05, 1e-6);
+    CHECK(!vrm::applyMorphs(prim, {0.0f, 0.0f}, pos, nrm));
+
+    vrm::Avatar av(model);
+    auto& w = av.morphWeights();
+    CHECK(w.size() == 1 && w[0].size() == 2);
+    vrm::ExpressionController ec(model, 7);
+    auto sel = ec.selectable();
+    CHECK(sel.size() == 3 && sel[0] == "neutral" && sel[1] == "happy" && sel[2] == (v1 ? "smug" : "Smug"));
+
+    // Automatic blinking over 20 seconds: a plausible number of full blinks.
+    int blinks = 0;
+    bool closed = false;
+    for (int f = 0; f < 1200; ++f) {
+        ec.update(1.0f / 60, w);
+        bool c = w[0][0] > 0.99f;
+        if (c && !closed) ++blinks;
+        closed = c;
+    }
+    CHECK(blinks >= 3 && blinks <= 14);
+
+    // Resting expression fades in; while it is on, blinking is suppressed (block) or reduced (blend).
+    ec.setBase("happy");
+    for (int f = 0; f < 30; ++f) ec.update(1.0f / 60, w);
+    CHECK_NEAR(ec.weightOf("happy"), 1.0, 1e-4);
+    CHECK_NEAR(w[0][1], 1.0, 1e-4);
+    float maxBlink = 0;
+    for (int f = 0; f < 600; ++f) { ec.update(1.0f / 60, w); maxBlink = std::max(maxBlink, w[0][0]); }
+    CHECK(maxBlink < 1e-4f);
+
+    // A reaction overrides the resting face, then hands back to it.
+    const std::string smugName = v1 ? "smug" : "Smug";
+    ec.trigger(smugName, 0.5f);
+    for (int f = 0; f < 15; ++f) ec.update(1.0f / 60, w);
+    CHECK(ec.weightOf(smugName) > 0.95f);
+    CHECK(ec.weightOf("happy") < 0.05f);
+    for (int f = 0; f < 120; ++f) ec.update(1.0f / 60, w);
+    CHECK_NEAR(ec.weightOf(smugName), 0.0, 1e-4);
+    CHECK_NEAR(ec.weightOf("happy"), 1.0, 1e-4);
+    ec.setBase("neutral");
+    for (int f = 0; f < 30; ++f) ec.update(1.0f / 60, w);
+    CHECK_NEAR(w[0][1], 0.0, 1e-4);
+}
+
+static void testSprings(const std::string& file, bool v1) {
+    std::printf("  springs %s\n", file.c_str());
+    vrm::Model model = vrm::loadFile(g_dir + "/" + file);
+    auto exp = expectedJson(file);
+    CHECK(static_cast<int>(model.springJoints.size()) == exp["springJoints"].integer());
+    CHECK(model.colliders.size() == 1 && model.colliderGroups.size() == 1);
+    vrm::Avatar av(model);
+    av.setScale(1.2f);
+    vrm::SpringSystem springs(av);
+    CHECK(springs.jointCount() == model.springJoints.size());
+
+    int head = model.humanBone("head");
+    int hair1 = -1;
+    for (size_t i = 0; i < model.nodes.size(); ++i)
+        if (model.nodes[i].name == "hair1") hair1 = static_cast<int>(i);
+    auto restTail = [&](size_t j) { return springs.tail(j); };
+
+    // 1) Standing still: the ponytail settles near its rest shape and keeps its length.
+    av.setRestPose({0, 0, 0}, 0, false);
+    springs.update(1.0f / 60);
+    Vec3 tail0 = restTail(0);
+    float len0 = length(tail0 - av.nodeWorld(hair1).translation());
+    for (int f = 0; f < 180; ++f) { av.setRestPose({0, 0, 0}, 0, false); springs.update(1.0f / 60); }
+    CHECK(length(restTail(0) - tail0) < 0.05f);
+    CHECK_NEAR(length(restTail(0) - av.nodeWorld(hair1).translation()), len0, 1e-4);
+
+    // 2) Running sideways: the hair lags behind the head, then swings back when stopping.
+    float x = 0;
+    for (int f = 0; f < 20; ++f) {
+        x += 0.08f;  // ~4.8 m/s
+        av.setRestPose({x, 0, 0}, 0, false);
+        springs.update(1.0f / 60);
+    }
+    float lag = restTail(1).x - av.nodeWorld(hair1).translation().x;
+    CHECK(lag < -0.01f);
+    for (int f = 0; f < 300; ++f) { av.setRestPose({x, 0, 0}, 0, false); springs.update(1.0f / 60); }
+    float settled = restTail(1).x - av.nodeWorld(hair1).translation().x;
+    CHECK(std::fabs(settled) < 0.02f);
+
+    // 3) A strong force pushing the hair into the face: it must slide around the head
+    //    collider, never through it.
+    Vec3 fwd = av.restForward();
+    springs.setExternalForce(fwd * 30.0f);
+    const Mat4& hw = av.nodeWorld(head);
+    float minClear = 1e9f;
+    for (int f = 0; f < 240; ++f) {
+        av.setRestPose({x, 0, 0}, 0, false);
+        springs.update(1.0f / 60);
+        Vec3 center = av.nodeWorld(head).transformPoint(model.colliders[0].offset);
+        float r = (model.colliders[0].radius + 0.02f) * av.scale();
+        for (size_t j = 0; j < springs.jointCount(); ++j) minClear = std::min(minClear, length(springs.tail(j) - center) - r);
+    }
+    (void)hw;
+    if (minClear <= -1e-3f) std::printf("  minClear = %f\n", minClear);
+    CHECK(minClear > -1e-3f);
+    // The force did move the hair forward (relative to rest).
+    Vec3 rel = springs.tail(springs.jointCount() - 1) - av.nodeWorld(hair1).translation();
+    CHECK(dot(rel, fwd) > -0.05f);
+
+    // 4) A teleport (respawn) resets instead of flinging the hair across the map.
+    springs.setExternalForce({});
+    av.setRestPose({x + 50, 0, 0}, 0, false);
+    springs.update(1.0f / 60);
+    CHECK(length(springs.tail(0) - av.nodeWorld(hair1).translation()) < 0.5f);
+    (void)v1;
 }
 
 int main(int argc, char** argv) {
@@ -343,6 +501,10 @@ int main(int argc, char** argv) {
         {"avatar_v0", [] { testAvatar("test_v0.vrm", false); }},
         {"cross_rig", testCrossRigRetarget},
         {"binding", testBinding},
+        {"expressions_v1", [] { testExpressions("test_v1.vrm", true); }},
+        {"expressions_v0", [] { testExpressions("test_v0.vrm", false); }},
+        {"springs_v1", [] { testSprings("test_v1.vrm", true); }},
+        {"springs_v0", [] { testSprings("test_v0.vrm", false); }},
     };
     for (auto& t : tests) {
         std::printf("[%s]\n", t.first);

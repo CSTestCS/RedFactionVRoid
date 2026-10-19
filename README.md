@@ -97,9 +97,28 @@ rfg.exe ──loads──▶ dxgi.dll (this mod) ──forwards──▶ C:\Wind
 * **Proxy** (`src/win/dxgi_proxy.cpp`, `dxgi_exports.S`): every `dxgi.dll` export is a
   `jmp` to the real DLL, so the game behaves exactly as before.
 
-Known limitations: no spring-bone (hair/skirt) physics, no facial expressions or lip-sync.
-Lighting is a fixed toon light, not the game's lighting. With `DepthMode=none`, scenery in
-front of Mason doesn't hide the avatar.
+### Hair, faces and lighting
+
+* **Hair / skirt physics.** The spring bones and colliders authored in the VRM (VRM 0.x
+  `secondaryAnimation` and VRM 1.0 `VRMC_springBone`) are simulated at 60 Hz
+  (`src/vrm/spring.cpp`). Hair swings when Mason runs, turns or jumps. It is pushed out of
+  the head and body colliders and freezes while the game is paused. `[Physics] Wind` adds a
+  breeze.
+* **Facial expressions.** The avatar blinks naturally. Choose its resting face in the VRM
+  menu (**FACE**: neutral, happy, angry, sad, relaxed, surprised, or the avatar's own custom
+  expressions). If Mason's health is configured (`[GameState] Health`), it winces when hit
+  and looks worried at low health (`[Expressions]`).
+* **Lighting.** With `Lighting=scene` (default), the avatar is lit from the game's own
+  rendered image around Mason. Bright Mars daylight, dark tunnels, red alarm lights and
+  explosions carry over onto the avatar, including the direction they come from. If the
+  sun's direction/colour in memory are configured (`[GameLighting]`), toon shading also
+  follows the time of day. `Lighting=fixed` restores a constant light.
+
+Remaining limitations:
+* No lip-sync to dialogue.
+* The lighting is an estimate from the screen, not the game's own lighting pass; shadows
+  cast by the world don't fall on the avatar.
+* With `DepthMode=none`, scenery in front of Mason doesn't hide the avatar.
 
 ## Building
 
@@ -130,6 +149,7 @@ mod's `dxgi.dll`. Run it from a folder containing `dxgi.dll` and a `vrm` folder:
 rfv_smoke.exe 150 menu.bmp menu     # opens the VRM menu with F7 and applies the first avatar
 rfv_smoke.exe 90 pause.bmp pause    # presses Esc: the VRM SKIN pause entry appears
 rfv_smoke.exe 120 world.bmp world   # fake skeleton + camera in memory: avatar follows it
+                                    # (RFV_SMOKE_BG=blue|orange|dark changes the scene colour)
 ```
 
 The mod saves the requested frame as a BMP (`RFVROID_CAPTURE_FRAME` / `RFVROID_CAPTURE_PATH`).

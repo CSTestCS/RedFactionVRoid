@@ -1,5 +1,6 @@
 #include "avatar.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <limits>
 
@@ -32,6 +33,14 @@ Avatar::Avatar(const Model& model) : model_(model) {
 
     world_.resize(n);
     worldR_.resize(n);
+    morphWeights_.resize(model_.meshes.size());
+    for (size_t m = 0; m < model_.meshes.size(); ++m) {
+        size_t targets = 0;
+        for (const auto& p : model_.meshes[m].primitives) targets = std::max(targets, p.targets.size());
+        morphWeights_[m].assign(targets, 0.0f);
+        for (size_t t = 0; t < targets && t < model_.meshes[m].defaultWeights.size(); ++t)
+            morphWeights_[m][t] = model_.meshes[m].defaultWeights[t];
+    }
     resetToRest();
     root_ = Mat4();
     rootRot_ = Quat{};

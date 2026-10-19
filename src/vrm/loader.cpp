@@ -1,5 +1,6 @@
 // glTF 2.0 binary (.glb / .vrm) loader with VRM 0.x and VRM 1.0 extension support.
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -191,6 +192,28 @@ Primitive loadPrimitive(const BinCtx& c, const Value& jp) {
 
     if (p.normals.empty()) computeNormals(p);
     p.material = jp["material"].integer(-1);
+
+    // Morph targets (blend shapes) for facial expressions.
+    const Value& targets = jp["targets"];
+    for (size_t t = 0; t < targets.size(); ++t) {
+        MorphTarget mt;
+        const Value& jt = targets[t];
+        if (jt.has("POSITION")) {
+            auto d = readAccessor(c, jt["POSITION"].integer(), comps);
+            if (comps == 3 && d.size() == vcount * 3) {
+                mt.dPos.resize(vcount);
+                for (size_t i = 0; i < vcount; ++i) mt.dPos[i] = {float(d[i * 3]), float(d[i * 3 + 1]), float(d[i * 3 + 2])};
+            }
+        }
+        if (jt.has("NORMAL")) {
+            auto d = readAccessor(c, jt["NORMAL"].integer(), comps);
+            if (comps == 3 && d.size() == vcount * 3) {
+                mt.dNrm.resize(vcount);
+                for (size_t i = 0; i < vcount; ++i) mt.dNrm[i] = {float(d[i * 3]), float(d[i * 3 + 1]), float(d[i * 3 + 2])};
+            }
+        }
+        p.targets.push_back(std::move(mt));  // keep indices aligned even if empty
+    }
     return p;
 }
 
@@ -315,6 +338,185 @@ void loadHumanoid(const BinCtx& c, Model& m) {
     }
 }
 
+OverrideMode parseOverride(const std::string& s) {
+    if (s == "block") return OverrideMode::Block;
+    if (s == "blend") return OverrideMode::Blend;
+    return OverrideMode::None;
+}
+
+void loadExpressions(const BinCtx& c, Model& m) {
+    const Value& ext = c.doc["extensions"];
+    if (m.version == VrmVersion::V1) {
+        const Value& ex = ext["VRMC_vrm"]["expressions"];
+        for (const char* group : {"preset", "custom"}) {
+            for (auto& kv : ex[group].members()) {
+                Expression e;
+                e.name = kv.first;
+                e.preset = std::string(group) == "preset";
+                e.binary = kv.second["isBinary"].boolean(false);
+                e.overrideBlink = parseOverride(kv.second["overrideBlink"].str("none"));
+                e.overrideMouth = parseOverride(kv.second["overrideMouth"].str("none"));
+                const Value& binds = kv.second["morphTargetBinds"];
+                for (size_t i = 0; i < binds.size(); ++i) {
+                    int node = binds[i]["node"].integer(-1);
+                    if (node < 0 || node >= static_cast<int>(m.nodes.size()) || m.nodes[node].mesh < 0) continue;
+                    e.binds.push_back({m.nodes[node].mesh, binds[i]["index"].integer(-1), float(binds[i]["weight"].num(1.0))});
+                }
+                m.expressions.push_back(std::move(e));
+            }
+        }
+    } else if (m.version == VrmVersion::V0) {
+        static const std::map<std::string, std::string> rename = {
+            {"joy", "happy"}, {"angry", "angry"}, {"sorrow", "sad"}, {"fun", "relaxed"}, {"surprised", "surprised"},
+            {"a", "aa"}, {"i", "ih"}, {"u", "ou"}, {"e", "ee"}, {"o", "oh"}, {"blink", "blink"},
+            {"blink_l", "blinkLeft"}, {"blink_r", "blinkRight"}, {"neutral", "neutral"},
+            {"lookup", "lookUp"}, {"lookdown", "lookDown"}, {"lookleft", "lookLeft"}, {"lookright", "lookRight"}};
+        const Value& groups = ext["VRM"]["blendShapeMaster"]["blendShapeGroups"];
+        for (size_t g = 0; g < groups.size(); ++g) {
+            const Value& jg = groups[g];
+            Expression e;
+            std::string preset = jg["presetName"].str("unknown");
+            auto it = rename.find(preset);
+            e.preset = it != rename.end();
+            e.name = e.preset ? it->second : jg["name"].str("custom" + std::to_string(g));
+            e.binary = jg["isBinary"].boolean(false);
+            // VRM 0.x has no override flags; emotions conventionally suppress blinking.
+            if (e.name == "happy" || e.name == "angry" || e.name == "sad" || e.name == "relaxed" || e.name == "surprised")
+                e.overrideBlink = OverrideMode::Blend;
+            const Value& binds = jg["binds"];
+            for (size_t i = 0; i < binds.size(); ++i)
+                e.binds.push_back({binds[i]["mesh"].integer(-1), binds[i]["index"].integer(-1), float(binds[i]["weight"].num(100.0) / 100.0)});
+            if (m.findExpression(e.name) < 0) m.expressions.push_back(std::move(e));
+        }
+    }
+    // Drop binds pointing at missing meshes / targets.
+    for (auto& e : m.expressions) {
+        std::vector<ExpressionBind> ok;
+        for (const auto& b : e.binds) {
+            if (b.mesh < 0 || b.mesh >= static_cast<int>(m.meshes.size()) || b.morph < 0) continue;
+            bool exists = false;
+            for (const auto& p : m.meshes[b.mesh].primitives)
+                if (b.morph < static_cast<int>(p.targets.size())) exists = true;
+            if (exists) ok.push_back(b);
+        }
+        e.binds.swap(ok);
+    }
+}
+
+Vec3 readXyz(const Value& v, Vec3 def) {
+    if (v.isArray() && v.size() >= 3) return {float(v[0].num()), float(v[1].num()), float(v[2].num())};
+    if (v.isObject()) return {float(v["x"].num(def.x)), float(v["y"].num(def.y)), float(v["z"].num(def.z))};
+    return def;
+}
+
+void loadSprings(const BinCtx& c, Model& m) {
+    const Value& ext = c.doc["extensions"];
+    int nodeCount = static_cast<int>(m.nodes.size());
+    auto validNode = [&](int n) { return n >= 0 && n < nodeCount; };
+    if (ext["VRMC_springBone"].isObject()) {
+        const Value& sb = ext["VRMC_springBone"];
+        const Value& cols = sb["colliders"];
+        for (size_t i = 0; i < cols.size(); ++i) {
+            SpringCollider col;
+            col.node = cols[i]["node"].integer(-1);
+            const Value& shape = cols[i]["shape"];
+            if (shape["sphere"].isObject()) {
+                col.offset = readXyz(shape["sphere"]["offset"], {});
+                col.radius = float(shape["sphere"]["radius"].num(0));
+            } else if (shape["capsule"].isObject()) {
+                col.capsule = true;
+                col.offset = readXyz(shape["capsule"]["offset"], {});
+                col.tail = readXyz(shape["capsule"]["tail"], {});
+                col.radius = float(shape["capsule"]["radius"].num(0));
+            }
+            m.colliders.push_back(col);  // keep indices aligned; invalid nodes are skipped at runtime
+        }
+        const Value& groups = sb["colliderGroups"];
+        for (size_t g = 0; g < groups.size(); ++g) {
+            std::vector<int> ids;
+            for (size_t k = 0; k < groups[g]["colliders"].size(); ++k) {
+                int id = groups[g]["colliders"][k].integer(-1);
+                if (id >= 0 && id < static_cast<int>(m.colliders.size())) ids.push_back(id);
+            }
+            m.colliderGroups.push_back(ids);
+        }
+        const Value& springs = sb["springs"];
+        for (size_t s = 0; s < springs.size(); ++s) {
+            std::vector<int> groupsOfSpring;
+            for (size_t k = 0; k < springs[s]["colliderGroups"].size(); ++k) groupsOfSpring.push_back(springs[s]["colliderGroups"][k].integer(-1));
+            const Value& joints = springs[s]["joints"];
+            // The last joint only marks where the chain ends; every other joint is simulated
+            // and points at the next one.
+            for (size_t j = 0; j + 1 < joints.size(); ++j) {
+                SpringJoint sj;
+                sj.node = joints[j]["node"].integer(-1);
+                sj.tailNode = joints[j + 1]["node"].integer(-1);
+                if (!validNode(sj.node) || !validNode(sj.tailNode)) continue;
+                sj.hitRadius = float(joints[j]["hitRadius"].num(0));
+                sj.stiffness = float(joints[j]["stiffness"].num(1.0));
+                sj.gravityPower = float(joints[j]["gravityPower"].num(0));
+                sj.gravityDir = readXyz(joints[j]["gravityDir"], {0, -1, 0});
+                sj.dragForce = float(joints[j]["dragForce"].num(0.5));
+                sj.colliderGroups = groupsOfSpring;
+                m.springJoints.push_back(sj);
+            }
+        }
+    } else if (ext["VRM"]["secondaryAnimation"].isObject()) {
+        // VRM 0.x stores vectors in Unity's left-handed space: glTF = (x, y, -z).
+        auto unity = [](Vec3 v) { return Vec3{v.x, v.y, -v.z}; };
+        const Value& sa = ext["VRM"]["secondaryAnimation"];
+        const Value& groups = sa["colliderGroups"];
+        for (size_t g = 0; g < groups.size(); ++g) {
+            std::vector<int> ids;
+            int node = groups[g]["node"].integer(-1);
+            for (size_t k = 0; k < groups[g]["colliders"].size(); ++k) {
+                const Value& jc = groups[g]["colliders"][k];
+                SpringCollider col;
+                col.node = node;
+                col.offset = unity(readXyz(jc["offset"], {}));
+                col.radius = float(jc["radius"].num(0));
+                ids.push_back(static_cast<int>(m.colliders.size()));
+                m.colliders.push_back(col);
+            }
+            m.colliderGroups.push_back(ids);
+        }
+        const Value& bg = sa["boneGroups"];
+        for (size_t g = 0; g < bg.size(); ++g) {
+            const Value& jg = bg[g];
+            SpringJoint proto;
+            proto.stiffness = float(jg["stiffiness"].num(jg["stiffness"].num(1.0)));  // sic: the 0.x spec misspells it
+            proto.gravityPower = float(jg["gravityPower"].num(0));
+            proto.gravityDir = unity(readXyz(jg["gravityDir"], {0, -1, 0}));
+            proto.dragForce = float(jg["dragForce"].num(0.4));
+            proto.hitRadius = float(jg["hitRadius"].num(0.02));
+            for (size_t k = 0; k < jg["colliderGroups"].size(); ++k) proto.colliderGroups.push_back(jg["colliderGroups"][k].integer(-1));
+            // Each listed bone is a root: it and all of its descendants swing. A bone points at
+            // its first child; leaves get a short virtual tail.
+            std::vector<int> stack;
+            for (size_t k = 0; k < jg["bones"].size(); ++k) stack.push_back(jg["bones"][k].integer(-1));
+            std::reverse(stack.begin(), stack.end());
+            while (!stack.empty()) {
+                int n = stack.back();
+                stack.pop_back();
+                if (!validNode(n)) continue;
+                SpringJoint sj = proto;
+                sj.node = n;
+                sj.tailNode = m.nodes[n].children.empty() ? -1 : m.nodes[n].children[0];
+                m.springJoints.push_back(sj);
+                const auto& ch = m.nodes[n].children;
+                for (auto it = ch.rbegin(); it != ch.rend(); ++it) stack.push_back(*it);
+            }
+        }
+    }
+    // Remove references to collider groups that don't exist.
+    for (auto& j : m.springJoints) {
+        std::vector<int> ok;
+        for (int g : j.colliderGroups)
+            if (g >= 0 && g < static_cast<int>(m.colliderGroups.size())) ok.push_back(g);
+        j.colliderGroups.swap(ok);
+    }
+}
+
 } // namespace
 
 Model loadGlb(const uint8_t* data, size_t size) {
@@ -390,6 +592,7 @@ Model loadGlb(const uint8_t* data, size_t size) {
     for (size_t i = 0; i < jmeshes.size(); ++i) {
         Mesh mesh;
         mesh.name = jmeshes[i]["name"].str("");
+        for (size_t k = 0; k < jmeshes[i]["weights"].size(); ++k) mesh.defaultWeights.push_back(float(jmeshes[i]["weights"][k].num(0)));
         const Value& prims = jmeshes[i]["primitives"];
         for (size_t k = 0; k < prims.size(); ++k) {
             try {
@@ -421,6 +624,8 @@ Model loadGlb(const uint8_t* data, size_t size) {
     loadTextures(c, m);
     loadMaterials(c, m);
     loadHumanoid(c, m);
+    loadExpressions(c, m);
+    loadSprings(c, m);
     if (m.version == VrmVersion::None) throw std::runtime_error("file is a glTF but has no VRM humanoid extension");
     if (m.humanBone(bones::Hips) < 0 || m.humanBone(bones::Head) < 0)
         throw std::runtime_error("VRM humanoid is missing required bones (hips/head)");

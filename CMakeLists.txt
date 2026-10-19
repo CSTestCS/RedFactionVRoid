@@ -13,6 +13,8 @@ set(RFV_CORE_SOURCES
   src/core/log.cpp
   src/vrm/loader.cpp
   src/vrm/avatar.cpp
+  src/vrm/spring.cpp
+  src/vrm/expression.cpp
   src/game/pointer_path.cpp
   src/game/binding.cpp
 )

@@ -7,6 +7,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -52,8 +53,8 @@ static void animateFakeGame(int frame) {
     for (int i = 0; i < kBones; ++i) {
         g_bones[i] = {{-1, 0, 0}, {0, 1, 0}, {0, 0, -1}, {kJoints[i][0], kJoints[i][1], kJoints[i][2]}};
     }
-    // Small idle sway so the "gameplay is running" detection sees movement.
-    float sway = 0.01f * static_cast<float>(frame % 20) / 20.0f;
+    // Mason strafes side to side (about 1 m), so hair and skirts have something to react to.
+    float sway = 0.5f * std::sin(frame * 0.12f);
     for (int i = 0; i < kBones; ++i) g_bones[i].p[0] += sway;
 }
 
@@ -116,6 +117,33 @@ int wmain(int argc, wchar_t** argv) {
     ID3D11RenderTargetView* rtv = nullptr;
     dev->CreateRenderTargetView(back, nullptr, &rtv);
 
+    // World mode draws a "scene" for the mod's scene lighting to pick up: cold blue light on
+    // the left, warm orange on the right, bright sky above, dark ground below.
+    ID3D11Texture2D* background = nullptr;
+    if (mode == L"world") {
+        std::vector<uint32_t> px(1280 * 720);
+        for (int y = 0; y < 720; ++y)
+            for (int x = 0; x < 1280; ++x) {
+                float fx = x / 1279.0f, fy = 1.0f - y / 719.0f;
+                float b = 0.25f + 0.75f * fy;
+                int r = static_cast<int>(255 * b * (0.25f + 0.75f * fx));
+                int g = static_cast<int>(255 * b * (0.45f + 0.15f * fx));
+                int bl = static_cast<int>(255 * b * (1.0f - 0.8f * fx));
+                wchar_t bg[16] = {};
+                if (x == 0 && y == 0) GetEnvironmentVariableW(L"RFV_SMOKE_BG", bg, 16);
+                static std::wstring theme = bg;
+                if (theme == L"blue") { r = 40; g = 70; bl = 200; }
+                else if (theme == L"orange") { r = 220; g = 120; bl = 40; }
+                else if (theme == L"dark") { r = 15; g = 12; bl = 10; }
+                px[y * 1280 + x] = 0xFF000000u | (bl << 16) | (g << 8) | r;
+            }
+        D3D11_TEXTURE2D_DESC bd;
+        back->GetDesc(&bd);
+        bd.BindFlags = 0;
+        D3D11_SUBRESOURCE_DATA init{px.data(), 1280 * 4, 0};
+        dev->CreateTexture2D(&bd, &init, &background);
+    }
+
     for (int i = 0; i < frames; ++i) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -144,6 +172,7 @@ int wmain(int argc, wchar_t** argv) {
         float clear[4] = {0.35f, 0.18f, 0.10f, 1.0f};
         ctx->OMSetRenderTargets(1, &rtv, nullptr);
         ctx->ClearRenderTargetView(rtv, clear);
+        if (background) ctx->CopyResource(back, background);
         sc->Present(0, 0);
         Sleep(16);
     }
