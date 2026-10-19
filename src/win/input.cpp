@@ -37,32 +37,118 @@ WORD g_padPrev = 0;
 DWORD g_padRepeatAt = 0;
 int g_stickDirPrev = 0;
 
+void pushLocked(Action a, bool pad) { g_queue.push_back({a, pad}); }
+
 void push(Action a, bool pad) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_queue.push_back({a, pad});
+    pushLocked(a, pad);
 }
 
 bool keyboardBlocked() { return g_capture || g_holdUntilRelease; }
 
-void onKeyDown(UINT vk, bool repeat) {
+// ---- Keyboard ------------------------------------------------------------------------
+// Keys are detected two ways, so they work however the game reads its input (window
+// messages, raw input with legacy messages disabled, DirectInput):
+//   * WM_KEYDOWN / WM_KEYUP in our window procedure;
+//   * polling the keyboard state once per frame (GetAsyncKeyState).
+// g_latched[vk] makes sure one physical press produces exactly one event.
+bool g_latched[256] = {};
+DWORD g_heldSince[256] = {};
+DWORD g_nextRepeat[256] = {};
+int g_loggedKeys = 0;
+
+const UINT kTrackedKeys[] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, 'W', 'S', VK_RETURN, VK_SPACE, VK_ESCAPE, VK_BACK,
+                             'V', VK_F9, VK_F10, VK_PRIOR, VK_NEXT, VK_INSERT, VK_DELETE};
+
+void emitKeyLocked(UINT vk, bool repeat) {
     switch (vk) {
-    case VK_UP: case 'W': push(Action::Up, false); break;
-    case VK_DOWN: case 'S': push(Action::Down, false); break;
-    case VK_LEFT: push(Action::Left, false); break;
-    case VK_RIGHT: push(Action::Right, false); break;
-    case VK_RETURN: case VK_SPACE: if (!repeat) push(Action::Accept, false); break;
-    case VK_ESCAPE: if (!repeat) { push(Action::Back, false); push(Action::Pause, false); } break;
-    case VK_BACK: if (!repeat) push(Action::Back, false); break;
-    case 'V': if (!repeat) push(Action::OpenSkinMenu, false); break;
-    case VK_F9: if (!repeat) push(Action::DebugToggle, false); break;
-    case VK_F10: if (!repeat) push(Action::LoggerToggle, false); break;
-    case VK_PRIOR: push(Action::PageUp, false); break;
-    case VK_NEXT: push(Action::PageDown, false); break;
-    case VK_INSERT: if (!repeat) push(Action::Insert, false); break;
-    case VK_DELETE: if (!repeat) push(Action::Delete, false); break;
+    case VK_UP: case 'W': pushLocked(Action::Up, false); break;
+    case VK_DOWN: case 'S': pushLocked(Action::Down, false); break;
+    case VK_LEFT: pushLocked(Action::Left, false); break;
+    case VK_RIGHT: pushLocked(Action::Right, false); break;
+    case VK_RETURN: case VK_SPACE: if (!repeat) pushLocked(Action::Accept, false); break;
+    case VK_ESCAPE: if (!repeat) { pushLocked(Action::Back, false); pushLocked(Action::Pause, false); } break;
+    case VK_BACK: if (!repeat) pushLocked(Action::Back, false); break;
+    case 'V': if (!repeat) pushLocked(Action::OpenSkinMenu, false); break;
+    case VK_F9: if (!repeat) pushLocked(Action::DebugToggle, false); break;
+    case VK_F10: if (!repeat) pushLocked(Action::LoggerToggle, false); break;
+    case VK_PRIOR: pushLocked(Action::PageUp, false); break;
+    case VK_NEXT: pushLocked(Action::PageDown, false); break;
+    case VK_INSERT: if (!repeat) pushLocked(Action::Insert, false); break;
+    case VK_DELETE: if (!repeat) pushLocked(Action::Delete, false); break;
     default: break;
     }
-    if (vk == g_hotkey && !repeat) push(Action::Hotkey, false);
+    if (vk == g_hotkey && !repeat) pushLocked(Action::Hotkey, false);
+}
+
+void keyPressedLocked(UINT vk, const char* source) {
+    if (vk >= 256 || g_latched[vk]) return;
+    g_latched[vk] = true;
+    g_heldSince[vk] = GetTickCount();
+    g_nextRepeat[vk] = g_heldSince[vk] + 400;
+    if (g_loggedKeys < 12 && (vk == g_hotkey || vk == VK_ESCAPE || vk == 'V')) {
+        ++g_loggedKeys;
+        RFV_LOG("Key 0x%02X pressed (seen via %s)", vk, source);
+    }
+    emitKeyLocked(vk, false);
+}
+
+void keyReleasedLocked(UINT vk) {
+    if (vk < 256) g_latched[vk] = false;
+}
+
+bool gameHasFocus() {
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+bool anyTrackedKeyDown() {
+    for (UINT vk : kTrackedKeys)
+        if (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) return true;
+    return (GetAsyncKeyState(static_cast<int>(g_hotkey)) & 0x8000) != 0;
+}
+
+void pollKeyboardLocked() {
+    if (!gameHasFocus()) return;
+    DWORD now = GetTickCount();
+    auto check = [&](UINT vk) {
+        bool down = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+        if (down && !g_latched[vk]) keyPressedLocked(vk, "keyboard state");
+        else if (!down && g_latched[vk]) keyReleasedLocked(vk);
+        else if (down && (vk == VK_UP || vk == VK_DOWN || vk == 'W' || vk == 'S' || vk == VK_PRIOR || vk == VK_NEXT) &&
+                 now >= g_nextRepeat[vk]) {
+            emitKeyLocked(vk, true);  // auto-repeat while held
+            g_nextRepeat[vk] = now + 90;
+        }
+    };
+    for (UINT vk : kTrackedKeys) check(vk);
+    bool trackedHotkey = false;
+    for (UINT vk : kTrackedKeys) trackedHotkey |= vk == g_hotkey;
+    if (!trackedHotkey && g_hotkey < 256) check(g_hotkey);
+}
+
+// Mouse: also polled, for games that hide button messages behind raw input.
+bool g_mouseLatched = false;
+
+void pollMouseLocked() {
+    if (!g_hwnd || !gameHasFocus()) return;
+    POINT pt;
+    RECT rc;
+    if (GetCursorPos(&pt) && ScreenToClient(g_hwnd, &pt) && GetClientRect(g_hwnd, &rc) && rc.right > 0 && rc.bottom > 0) {
+        float sx = g_bbW ? static_cast<float>(g_bbW) / rc.right : 1.0f;
+        float sy = g_bbH ? static_cast<float>(g_bbH) / rc.bottom : 1.0f;
+        float x = pt.x * sx, y = pt.y * sy;
+        if (x != g_mouse.x || y != g_mouse.y) {
+            g_mouse.x = x;
+            g_mouse.y = y;
+            g_mouse.moved = true;
+        }
+    }
+    bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    if (down && !g_mouseLatched) { g_mouseLatched = true; g_mouse.clicked = true; }
+    else if (!down) g_mouseLatched = false;
 }
 
 void updateMouse(LPARAM lp) {
@@ -83,10 +169,10 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UINT vk = static_cast<UINT>(wp);
         bool repeat = (lp & (1 << 30)) != 0;
         bool wasBlocked = keyboardBlocked();
-        onKeyDown(vk, repeat);
-        if (wasBlocked) {
+        {
             std::lock_guard<std::mutex> lock(g_mutex);
-            g_keysDown.insert(vk);
+            if (!repeat) keyPressedLocked(vk, "window message");
+            if (wasBlocked) g_keysDown.insert(vk);
         }
         if (wasBlocked && vk != VK_F4) return 0;  // keep Alt+F4 working
         break;
@@ -97,6 +183,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_keysDown.erase(static_cast<UINT>(wp));
+            keyReleasedLocked(static_cast<UINT>(wp));
         }
         if (blocked) return 0;
         break;
@@ -113,7 +200,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         updateMouse(lp);
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            g_mouse.clicked = true;
+            if (!g_mouseLatched) { g_mouse.clicked = true; g_mouseLatched = true; }
         }
         if (g_capture) return 0;
         break;
@@ -250,11 +337,12 @@ void hookDirectInput() {
 } // namespace
 
 void install(HWND hwnd, UINT hotkeyVk) {
-    if (g_hwnd || !hwnd) return;
-    g_hwnd = hwnd;
     g_hotkey = hotkeyVk;
+    if (!hwnd || hwnd == g_hwnd) return;
+    if (g_hwnd && g_origWndProc) SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_origWndProc));
     g_origWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&wndProc)));
-    RFV_LOG("Window procedure hooked");
+    g_hwnd = hwnd;
+    RFV_LOG("Window procedure hooked (window %p)", static_cast<void*>(hwnd));
 }
 
 void uninstall() {
@@ -282,7 +370,7 @@ void setCapture(bool capture) {
     bool was = g_capture.exchange(capture);
     if (was && !capture) {
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_holdUntilRelease = !g_keysDown.empty();
+        g_holdUntilRelease = !g_keysDown.empty() || anyTrackedKeyDown();
     }
 }
 
@@ -296,7 +384,9 @@ void setBackBufferSize(UINT w, UINT h) {
 std::vector<Event> poll(MouseState& mouse) {
     pollPad();
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_holdUntilRelease && g_keysDown.empty()) g_holdUntilRelease = false;
+    pollKeyboardLocked();
+    pollMouseLocked();
+    if (g_holdUntilRelease && g_keysDown.empty() && !anyTrackedKeyDown()) g_holdUntilRelease = false;
     std::vector<Event> out;
     out.swap(g_queue);
     mouse = g_mouse;

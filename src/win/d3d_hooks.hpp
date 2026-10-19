@@ -32,8 +32,16 @@ public:
     virtual void onBeforeResize() = 0;
 };
 
-// Creates a throw-away device to find and patch the DXGI/D3D11 vtables. Call from a
-// worker thread (never from DllMain).
+// Precise hooks on the game's own objects, called by the proxy exports as the game
+// creates them (safe to call more than once).
+void hookFactory(IUnknown* factory);
+void hookCreatedDevice(ID3D11Device* device);
+void hookCreatedSwapChain(IDXGISwapChain* swapChain);
+void setPresentListener(PresentListener* listener);
+unsigned presentCount();  // frames presented since startup (0 = Present hook never ran)
+
+// Fallback: creates a throw-away device to find and patch the DXGI/D3D11 vtables. Call
+// from a worker thread (never from DllMain).
 bool installD3DHooks(PresentListener* listener);
 void uninstallD3DHooks();
 

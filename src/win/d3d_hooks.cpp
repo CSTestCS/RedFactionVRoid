@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <dxgi1_2.h>
+#include <atomic>
 
 #include <atomic>
 #include <map>
@@ -29,7 +30,8 @@ VtableHook g_present(kSwapPresent), g_present1(kSwap1Present1), g_resize(kSwapRe
 VtableHook g_createLayout(kDevCreateInputLayout), g_drawIndexed(kCtxDrawIndexed),
     g_drawIndexedInst(kCtxDrawIndexedInstanced), g_setLayout(kCtxIASetInputLayout), g_omSet(kCtxOMSetRenderTargets);
 
-PresentListener* g_listener = nullptr;
+std::atomic<PresentListener*> g_listener{nullptr};
+std::atomic<unsigned> g_presentCount{0};
 std::atomic<bool> g_gameObjectsHooked{false};
 thread_local int g_presentDepth = 0;
 
@@ -76,7 +78,14 @@ void beforePresent(IDXGISwapChain* sc) {
     }
     DXGI_SWAP_CHAIN_DESC desc;
     if (SUCCEEDED(sc->GetDesc(&desc))) { g_backW = desc.BufferDesc.Width; g_backH = desc.BufferDesc.Height; }
-    if (g_listener) g_listener->onPresent(sc);
+    unsigned n = ++g_presentCount;
+    if (n == 1) {
+        DXGI_SWAP_CHAIN_DESC d{};
+        sc->GetDesc(&d);
+        RFV_LOG("First Present: %ux%u format %d, %u buffers, swap effect %d, %s", d.BufferDesc.Width, d.BufferDesc.Height,
+                static_cast<int>(d.BufferDesc.Format), d.BufferCount, static_cast<int>(d.SwapEffect), d.Windowed ? "windowed" : "fullscreen");
+    }
+    if (PresentListener* l = g_listener.load()) l->onPresent(sc);
 }
 
 HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
@@ -94,7 +103,7 @@ HRESULT STDMETHODCALLTYPE hkPresent1(IDXGISwapChain1* sc, UINT sync, UINT flags,
 }
 
 HRESULT STDMETHODCALLTYPE hkResize(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags) {
-    if (g_listener) g_listener->onBeforeResize();
+    if (PresentListener* l = g_listener.load()) l->onBeforeResize();
     {
         std::lock_guard<std::mutex> lock(g_depthMutex);
         if (g_capturedDepth) { g_capturedDepth->Release(); g_capturedDepth = nullptr; }
@@ -216,9 +225,110 @@ void hookGameObjects(IDXGISwapChain* sc) {
     }
 }
 
+// ---- swap-chain creation (catches the game's real swap chain, whatever its class)
+constexpr int kFactoryCreateSwapChain = 10;
+constexpr int kFactory2CreateForHwnd = 15;
+constexpr int kFactory2CreateForCoreWindow = 16;
+constexpr int kFactory2CreateForComposition = 24;
+VtableHook g_fCreate(kFactoryCreateSwapChain), g_fCreateHwnd(kFactory2CreateForHwnd),
+    g_fCreateCore(kFactory2CreateForCoreWindow), g_fCreateComp(kFactory2CreateForComposition);
+
+void onSwapChainCreated(IUnknown* obj, const char* how) {
+    IDXGISwapChain* sc = nullptr;
+    if (obj && SUCCEEDED(obj->QueryInterface(__uuidof(IDXGISwapChain), reinterpret_cast<void**>(&sc)))) {
+        DXGI_SWAP_CHAIN_DESC d{};
+        sc->GetDesc(&d);
+        RFV_LOG("Game created a swap chain (%s): %ux%u, swap effect %d", how, d.BufferDesc.Width, d.BufferDesc.Height,
+                static_cast<int>(d.SwapEffect));
+        hookSwapChain(sc);
+        sc->Release();
+    }
+}
+
+HRESULT STDMETHODCALLTYPE hkFactoryCreateSwapChain(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+    HRESULT hr = g_fCreate.orig<Fn>(f)(f, dev, desc, out);
+    if (SUCCEEDED(hr) && out && *out) onSwapChainCreated(*out, "CreateSwapChain");
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE hkFactoryCreateForHwnd(IDXGIFactory2* f, IUnknown* dev, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+                                                 const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs, IDXGIOutput* out, IDXGISwapChain1** sc) {
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
+                                           const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+    HRESULT hr = g_fCreateHwnd.orig<Fn>(f)(f, dev, hwnd, desc, fs, out, sc);
+    if (SUCCEEDED(hr) && sc && *sc) onSwapChainCreated(*sc, "CreateSwapChainForHwnd");
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE hkFactoryCreateForCore(IDXGIFactory2* f, IUnknown* dev, IUnknown* wnd, const DXGI_SWAP_CHAIN_DESC1* desc,
+                                                 IDXGIOutput* out, IDXGISwapChain1** sc) {
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+    HRESULT hr = g_fCreateCore.orig<Fn>(f)(f, dev, wnd, desc, out, sc);
+    if (SUCCEEDED(hr) && sc && *sc) onSwapChainCreated(*sc, "CreateSwapChainForCoreWindow");
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE hkFactoryCreateForComp(IDXGIFactory2* f, IUnknown* dev, const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* out,
+                                                 IDXGISwapChain1** sc) {
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+    HRESULT hr = g_fCreateComp.orig<Fn>(f)(f, dev, desc, out, sc);
+    if (SUCCEEDED(hr) && sc && *sc) onSwapChainCreated(*sc, "CreateSwapChainForComposition");
+    return hr;
+}
+
+void hookFactoryObject(IUnknown* obj) {
+    IDXGIFactory* f = nullptr;
+    if (!obj || FAILED(obj->QueryInterface(__uuidof(IDXGIFactory), reinterpret_cast<void**>(&f)))) return;
+    g_fCreate.install(f, reinterpret_cast<void*>(&hkFactoryCreateSwapChain));
+    IDXGIFactory2* f2 = nullptr;
+    if (SUCCEEDED(f->QueryInterface(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(&f2)))) {
+        g_fCreateHwnd.install(f2, reinterpret_cast<void*>(&hkFactoryCreateForHwnd));
+        g_fCreateCore.install(f2, reinterpret_cast<void*>(&hkFactoryCreateForCore));
+        g_fCreateComp.install(f2, reinterpret_cast<void*>(&hkFactoryCreateForComp));
+        f2->Release();
+    }
+    f->Release();
+}
+
 LRESULT CALLBACK dummyWndProc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProcW(h, m, w, l); }
 
 } // namespace
+
+namespace {
+void hookFactoryOfDevice(ID3D11Device* dev) {
+    IDXGIDevice* dxgiDev = nullptr;
+    if (FAILED(dev->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDev)))) return;
+    IDXGIAdapter* adapter = nullptr;
+    if (SUCCEEDED(dxgiDev->GetAdapter(&adapter))) {
+        IDXGIFactory* f = nullptr;
+        if (SUCCEEDED(adapter->GetParent(__uuidof(IDXGIFactory), reinterpret_cast<void**>(&f)))) {
+            hookFactoryObject(f);
+            f->Release();
+        }
+        adapter->Release();
+    }
+    dxgiDev->Release();
+}
+} // namespace
+
+void setPresentListener(PresentListener* listener) { g_listener = listener; }
+unsigned presentCount() { return g_presentCount.load(); }
+
+void hookFactory(IUnknown* factory) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) RFV_LOG("Game created a DXGI factory; hooking swap-chain creation");
+    hookFactoryObject(factory);
+}
+
+void hookCreatedDevice(ID3D11Device* dev) {
+    static std::atomic<int> count{0};
+    if (count++ < 4) RFV_LOG("Game created a D3D11 device (feature level 0x%x); hooking it", static_cast<unsigned>(dev->GetFeatureLevel()));
+    ID3D11DeviceContext* ctx = nullptr;
+    dev->GetImmediateContext(&ctx);
+    hookDeviceAndContext(dev, ctx);
+    if (ctx) ctx->Release();
+    hookFactoryOfDevice(dev);
+}
+
+void hookCreatedSwapChain(IDXGISwapChain* sc) { onSwapChainCreated(sc, "D3D11CreateDeviceAndSwapChain"); }
 
 bool installD3DHooks(PresentListener* listener) {
     g_listener = listener;
@@ -263,17 +373,19 @@ bool installD3DHooks(PresentListener* listener) {
     }
     hookSwapChain(sc);
     hookDeviceAndContext(dev, ctx);
+    hookFactoryOfDevice(dev);
     ctx->Release();
     dev->Release();
     sc->Release();
     DestroyWindow(hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
-    RFV_LOG("DXGI/D3D11 vtable hooks installed");
+    RFV_LOG("Fallback DXGI/D3D11 vtable hooks installed (from a test device)");
     return true;
 }
 
 void uninstallD3DHooks() {
-    for (VtableHook* h : {&g_present, &g_present1, &g_resize, &g_createLayout, &g_drawIndexed, &g_drawIndexedInst, &g_setLayout, &g_omSet})
+    for (VtableHook* h : {&g_present, &g_present1, &g_resize, &g_createLayout, &g_drawIndexed, &g_drawIndexedInst, &g_setLayout, &g_omSet,
+                          &g_fCreate, &g_fCreateHwnd, &g_fCreateCore, &g_fCreateComp})
         h->uninstallAll();
     g_listener = nullptr;
 }

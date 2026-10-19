@@ -14,6 +14,7 @@
 #include "../core/log.hpp"
 #include "memory_win.hpp"
 #include "paths.hpp"
+#include "proxy.hpp"
 #include "state_backup.hpp"
 
 namespace rfv::win {
@@ -168,23 +169,106 @@ void Mod::saveHiddenDraws() {
     draws::setHidden(hiddenDraws_);
 }
 
+namespace {
+
+std::string windowsVersion() {
+    using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+    auto fn = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+    OSVERSIONINFOW v{};
+    v.dwOSVersionInfoSize = sizeof(v);
+    if (!fn || fn(&v) != 0) return "unknown";
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%lu.%lu build %lu", v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber);
+    return buf;
+}
+
+struct FindWindowCtx {
+    DWORD pid;
+    HWND best = nullptr;
+    long bestArea = 0;
+};
+
+BOOL CALLBACK findGameWindowCb(HWND h, LPARAM lp) {
+    auto* c = reinterpret_cast<FindWindowCtx*>(lp);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != c->pid || !IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
+    wchar_t cls[64] = {};
+    GetClassNameW(h, cls, 64);
+    if (std::wstring(cls).rfind(L"RFVRoid", 0) == 0) return TRUE;
+    RECT r;
+    if (!GetClientRect(h, &r)) return TRUE;
+    long area = static_cast<long>(r.right) * r.bottom;
+    if (r.right >= 320 && r.bottom >= 200 && area > c->bestArea) { c->best = h; c->bestArea = area; }
+    return TRUE;
+}
+
+HWND findGameWindow() {
+    FindWindowCtx c{GetCurrentProcessId()};
+    EnumWindows(findGameWindowCb, reinterpret_cast<LPARAM>(&c));
+    return c.best;
+}
+
+} // namespace
+
 void Mod::start() {
     log::open(logPath());
-    RFV_LOG("RedFactionVRoid starting (game folder: %s)", gameDirectory().c_str());
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    RFV_LOG("RedFactionVRoid %s starting", RFV_VERSION_STRING);
+    RFV_LOG("Game: %s", narrow(exe).c_str());
+    RFV_LOG("Loaded as: %s", narrow(proxySelfPath()).c_str());
+    RFV_LOG("Windows %s", windowsVersion().c_str());
     loadConfig();
     vrmDirectory();  // make sure the folder exists so players know where to put files
     if (!cfg_.getBool("General", "Enabled", true)) {
         RFV_LOG("Disabled in RFVRoid.ini");
         return;
     }
-    if (!installD3DHooks(this)) {
-        RFV_LOG("Failed to install D3D hooks; the mod is inactive");
-        return;
-    }
+    setPresentListener(this);
+    // Precise hooks are installed by the proxy exports as the game creates its device and
+    // swap chain. The fallback (patching vtables from a throw-away test device) only runs
+    // later, if no frame has reached the mod, so it never races the game's own startup.
+
     std::string skin = state_.get("State", "Skin");
     if (!skin.empty() && state_.getBool("State", "Enabled", true)) {
         if (fileExists(skin)) requestLoad(skin);
         else RFV_LOG("Saved skin %s no longer exists", skin.c_str());
+    }
+
+    // Watchdog: find the game window (so hotkeys work even before the first frame) and
+    // report clearly in the log if rendering never reaches the mod.
+    UINT hotkey = static_cast<UINT>(cfg_.getInt("General", "MenuHotkey", VK_F7));
+    DWORD startTick = GetTickCount(), windowTick = 0;
+    bool warned = false, fallbackTried = false;
+    for (;;) {
+        Sleep(500);
+        if (!windowTick) {
+            if (HWND w = findGameWindow()) {
+                windowTick = GetTickCount();
+                wchar_t title[128] = {};
+                GetWindowTextW(w, title, 128);
+                RFV_LOG("Game window found: \"%s\"", narrow(title).c_str());
+                input::install(w, hotkey);
+                input::hookGameInput();
+            }
+        }
+        unsigned frames = presentCount();
+        if (frames > 0) {
+            RFV_LOG("Rendering hook is working (%u frames so far)", frames);
+            break;
+        }
+        if (!fallbackTried && windowTick && GetTickCount() - windowTick > 5000) {
+            fallbackTried = true;
+            RFV_LOG("No frame seen 5 s after the window appeared; installing fallback hooks");
+            if (!installD3DHooks(this)) RFV_LOG("Fallback hooks could not be installed");
+        }
+        if (!warned && windowTick && GetTickCount() - windowTick > 20000) {
+            warned = true;
+            RFV_LOG("WARNING: the game window has been open for 20 s but no frame has reached the mod. "
+                    "The overlay and menu cannot be shown. Please send this log file to the mod author.");
+        }
+        if (GetTickCount() - startTick > 10 * 60 * 1000) break;
     }
 }
 
@@ -369,6 +453,10 @@ void Mod::onPresent(IDXGISwapChain* sc) {
     if (!d3dReady_) {
         d3dReady_ = initD3D(sc);
         if (!d3dReady_) { d3dFailed_ = true; return; }
+        UINT hk = static_cast<UINT>(cfg_.getInt("General", "MenuHotkey", VK_F7));
+        wchar_t keyName[32] = L"F7";
+        if (UINT scan = MapVirtualKeyW(hk, MAPVK_VK_TO_VSC)) GetKeyNameTextW(static_cast<LONG>(scan << 16), keyName, 32);
+        showToast("REDFACTIONVROID ACTIVE  -  PAUSE + V / Y, OR " + upper(narrow(keyName)), 10000);
     }
     DXGI_SWAP_CHAIN_DESC desc;
     if (FAILED(sc->GetDesc(&desc))) return;

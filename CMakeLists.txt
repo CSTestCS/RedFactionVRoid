@@ -20,7 +20,7 @@ set(RFV_CORE_SOURCES
 )
 
 if(WIN32)
-  # ---------------------------------------------------------------- the mod (dxgi.dll)
+  # ---------------------------------------------------------------- the mod (d3d11.dll / dxgi.dll)
   enable_language(ASM)
   if(NOT MINGW)
     message(FATAL_ERROR "The mod uses GNU assembler export trampolines; build it with MinGW-w64 "
@@ -38,9 +38,9 @@ if(WIN32)
   add_library(rfv_dxgi SHARED
     ${RFV_CORE_SOURCES}
     src/win/dllmain.cpp
-    src/win/dxgi_proxy.cpp
-    src/win/dxgi_exports.S
-    src/win/dxgi.def
+    src/win/proxy.cpp
+    src/win/proxy_exports.S
+    src/win/proxy.def
     src/win/paths.cpp
     src/win/vtable_hook.cpp
     src/win/memory_win.cpp
@@ -54,7 +54,7 @@ if(WIN32)
     ${GEN_DIR}/default_config.inc
   )
   set_target_properties(rfv_dxgi PROPERTIES
-    OUTPUT_NAME dxgi
+    OUTPUT_NAME d3d11
     PREFIX ""
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -63,12 +63,12 @@ if(WIN32)
     WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _WIN32_WINNT=0x0601 __USE_MINGW_ANSI_STDIO=1
     RFV_VERSION_STRING="${PROJECT_VERSION}")
   target_compile_options(rfv_dxgi PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type>)
-  # Never link dxgi/d3d11 import libraries: this DLL *is* dxgi.dll. Everything is loaded at runtime.
+  # Never link dxgi/d3d11 import libraries: this DLL *is* d3d11.dll / dxgi.dll. Everything is loaded at runtime.
   target_link_libraries(rfv_dxgi PRIVATE ole32 oleaut32 windowscodecs shell32 gdi32 user32 uuid dxguid)
   target_link_options(rfv_dxgi PRIVATE -static -static-libgcc -static-libstdc++ -s)
 
   # ---------------------------------------------------------------- installer (.exe)
-  set(PAYLOAD_DLL ${CMAKE_BINARY_DIR}/bin/dxgi.dll)
+  set(PAYLOAD_DLL ${CMAKE_BINARY_DIR}/bin/d3d11.dll)
   set(MANIFEST ${CMAKE_SOURCE_DIR}/src/installer/installer.manifest)
   set(RFV_VERSION ${PROJECT_VERSION})
   set(RFV_VERSION_COMMAS "${PROJECT_VERSION_MAJOR},${PROJECT_VERSION_MINOR},${PROJECT_VERSION_PATCH},0")
@@ -104,6 +104,6 @@ if(WIN32)
   add_executable(rfv_smoke tests/win_smoke.cpp)
   set_target_properties(rfv_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
   target_compile_definitions(rfv_smoke PRIVATE UNICODE _UNICODE)
-  target_link_libraries(rfv_smoke PRIVATE uuid dxguid)
+  target_link_libraries(rfv_smoke PRIVATE d3d11 uuid dxguid)
   target_link_options(rfv_smoke PRIVATE -static -static-libgcc -static-libstdc++ -municode)
 endif()

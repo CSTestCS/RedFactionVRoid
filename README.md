@@ -26,12 +26,28 @@ touch save files, game archives or the network.
 
 **Option B: manual**
 
-Copy `dxgi.dll` into the game folder, next to `rfg.exe`
-(Steam → right-click the game → *Manage* → *Browse local files*).
+Copy `d3d11.dll` into the game folder, next to `rfg.exe`
+(Steam → right-click the game → *Manage* → *Browse local files*). Optionally copy it a
+second time as `dxgi.dll` (the installer does both; only one copy runs the mod).
 
-If you already use a mod that is also named `dxgi.dll` (e.g. ReShade), the installer renames
-it to `dxgi_chain.dll`. RedFactionVRoid then loads it, so both keep working. To uninstall,
-run the installer again and choose *No* (uninstall), or delete `dxgi.dll`.
+If you already use a mod with one of these names (e.g. ReShade), the installer renames it to
+`d3d11_chain.dll` / `dxgi_chain.dll`. RedFactionVRoid then loads it, so both keep working.
+To uninstall, run the installer again and choose *No* (uninstall).
+
+**Upgrading from the first version** (which installed only `dxgi.dll`): just run the new
+installer. It replaces `dxgi.dll` and adds `d3d11.dll`.
+
+### Is it working?
+
+When the game starts, a **REDFACTIONVROID ACTIVE** banner appears at the top of the screen
+for a few seconds. If you don't see it, open `RFVRoid.log` in the game folder:
+
+| What the log shows | Meaning |
+|---|---|
+| No `RFVRoid.log` at all | The game didn't load the mod. Check that `d3d11.dll` is next to `rfg.exe`. On Steam Deck/Proton, add `WINEDLLOVERRIDES="d3d11,dxgi=n,b" %command%` to the launch options. |
+| `Rendering hook is working` | Hooks are fine. Pause and press **V** / **Y**, or **F7**. |
+| `WARNING: ... no frame has reached the mod` | The mod is loaded but can't draw. Please share the log. |
+| `Key 0x76 pressed` | F7 was detected. |
 
 ## Using it
 
@@ -75,7 +91,10 @@ Log file: `RFVRoid.log` in the game folder.
 ## How it works
 
 ```
-rfg.exe ──loads──▶ dxgi.dll (this mod) ──forwards──▶ C:\Windows\System32\dxgi.dll
+rfg.exe ──loads──▶ d3d11.dll (this mod) ──forwards──▶ C:\Windows\System32\d3d11.dll
+                        │   (also installed as dxgi.dll; only the first copy runs the mod)
+                        ├─ wraps D3D11CreateDevice* / CreateDXGIFactory* → hooks the game's
+                        │  real device and swap chain as they are created
                         │
                         ├─ hooks IDXGISwapChain::Present  → runs the mod once per frame
                         ├─ hooks ID3D11DeviceContext::DrawIndexed → skips Mason's draws
@@ -94,8 +113,11 @@ rfg.exe ──loads──▶ dxgi.dll (this mod) ──forwards──▶ C:\Wind
   avatar's bone axes and rest poses don't have to match.
 * **Game binding** (`src/game/`): Cheat-Engine-style pointer paths with byte-signature
   scanning. Game patches can be handled by editing the .ini, without recompiling.
-* **Proxy** (`src/win/dxgi_proxy.cpp`, `dxgi_exports.S`): every `dxgi.dll` export is a
-  `jmp` to the real DLL, so the game behaves exactly as before.
+* **Proxy** (`src/win/proxy.cpp`, `proxy_exports.S`): every `d3d11.dll` / `dxgi.dll` export
+  jumps to the real DLL (loaded on first use, never inside `DllMain`), so the game behaves
+  exactly as before. Device and factory creation are wrapped to hook the game's own objects.
+* **Input** (`src/win/input.cpp`): keys are read both from window messages and from the
+  keyboard state every frame, so hotkeys work even if the game uses raw input or DirectInput.
 
 ### Hair, faces and lighting
 
@@ -127,7 +149,7 @@ Requirements: CMake ≥ 3.16 and MinGW-w64 (GCC). Cross-compiling from Linux:
 ```sh
 sudo apt install mingw-w64 cmake python3
 cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
-cmake --build build-win -j          # -> build-win/bin/dxgi.dll, RFVRoid_Installer.exe
+cmake --build build-win -j          # -> build-win/bin/d3d11.dll, RFVRoid_Installer.exe
 ```
 
 On Windows, use an MSYS2 MinGW64 shell: `cmake -S . -B build -G Ninja && cmake --build build`.
@@ -142,23 +164,25 @@ cmake -S . -B build-host && cmake --build build-host -j && ctest --test-dir buil
 
 ### Testing
 
-`rfv_smoke.exe` (built with the Windows targets) acts like a tiny D3D11 game that loads the
-mod's `dxgi.dll`. Run it from a folder containing `dxgi.dll` and a `vrm` folder:
+`rfv_smoke.exe` (built with the Windows targets) acts like a tiny D3D11 game. Like
+`rfg.exe`, it imports `d3d11.dll`, so it loads the mod from its own folder. Run it from a
+folder containing the mod as `d3d11.dll` (and optionally `dxgi.dll`) plus a `vrm` folder:
 
 ```sh
 rfv_smoke.exe 150 menu.bmp menu     # opens the VRM menu with F7 and applies the first avatar
 rfv_smoke.exe 90 pause.bmp pause    # presses Esc: the VRM SKIN pause entry appears
+rfv_smoke.exe 0 x prepare-world     # writes RFVRoid.ini for the world test (run first)
 rfv_smoke.exe 120 world.bmp world   # fake skeleton + camera in memory: avatar follows it
                                     # (RFV_SMOKE_BG=blue|orange|dark changes the scene colour)
 ```
 
 The mod saves the requested frame as a BMP (`RFVROID_CAPTURE_FRAME` / `RFVROID_CAPTURE_PATH`).
-On Linux it runs under Wine with `WINEDLLOVERRIDES="dxgi=n,b"` and `xvfb-run`.
+On Linux it runs under Wine with `WINEDLLOVERRIDES="d3d11,dxgi=n,b"` and `xvfb-run`.
 
 The shaders avoid structured and typed buffers so they also compile with Wine/Proton's HLSL
 compiler (relevant for Steam Deck).
-On Proton, add `WINEDLLOVERRIDES="dxgi=n,b" %command%` to the game's launch options so the
-mod's `dxgi.dll` is used.
+On Proton, add `WINEDLLOVERRIDES="d3d11,dxgi=n,b" %command%` to the game's launch options
+so the mod's DLLs are used.
 
 ## Avatar licences
 

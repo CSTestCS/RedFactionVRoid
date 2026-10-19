@@ -28,7 +28,7 @@ jobs:
           cmake -S . -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
           cmake --build build-win -j
           mkdir -p dist
-          cp build-win/bin/dxgi.dll build-win/bin/RFVRoid_Installer.exe config/RFVRoid.ini README.md dist/
+          cp build-win/bin/d3d11.dll build-win/bin/RFVRoid_Installer.exe config/RFVRoid.ini README.md dist/
       - uses: actions/upload-artifact@v4
         with:
           name: RedFactionVRoid
@@ -39,5 +39,5 @@ jobs:
         with:
           files: |
             dist/RFVRoid_Installer.exe
-            dist/dxgi.dll
+            dist/d3d11.dll
             dist/RFVRoid.ini

@@ -178,33 +178,55 @@ bool writePayload(const std::wstring& dest, std::wstring& error) {
     return true;
 }
 
-bool install(const std::wstring& dir, std::wstring& message) {
-    std::wstring dxgi = dir + L"\\dxgi.dll", chain = dir + L"\\dxgi_chain.dll";
-    if (fileExists(dxgi) && !isOurDll(dxgi)) {
-        // Another dxgi.dll mod (e.g. ReShade): keep it working by chaining to it.
+// The mod is installed under both names. The game always loads d3d11.dll from its folder;
+// dxgi.dll is a second entry point. Whichever loads first runs the mod.
+const wchar_t* kProxyNames[] = {L"d3d11", L"dxgi"};
+
+bool installOne(const std::wstring& dir, const wchar_t* base, std::wstring& message, std::wstring& notes) {
+    std::wstring dll = dir + L"\\" + base + L".dll", chain = dir + L"\\" + base + L"_chain.dll";
+    if (fileExists(dll) && !isOurDll(dll)) {
+        // Another mod with this name (e.g. ReShade): keep it working by chaining to it.
         if (fileExists(chain)) {
-            message = L"Both dxgi.dll and dxgi_chain.dll already exist and neither is RedFactionVRoid.\n"
-                      L"Please remove one of them and run the installer again.";
+            message = std::wstring(L"Both ") + base + L".dll and " + base + L"_chain.dll already exist and neither is "
+                      L"RedFactionVRoid.\nPlease remove one of them and run the installer again.";
             return false;
         }
-        if (!MoveFileW(dxgi.c_str(), chain.c_str())) { message = L"Could not rename the existing dxgi.dll."; return false; }
+        if (!MoveFileW(dll.c_str(), chain.c_str())) { message = std::wstring(L"Could not rename the existing ") + base + L".dll."; return false; }
+        notes += std::wstring(L"\nYour previous ") + base + L".dll was kept as " + base + L"_chain.dll and is still loaded.";
     }
     std::wstring err;
-    if (!writePayload(dxgi, err)) { message = err; return false; }
+    if (!writePayload(dll, err)) { message = err; return false; }
+    return true;
+}
+
+bool uninstallOne(const std::wstring& dir, const wchar_t* base, bool& removedAny, std::wstring& message) {
+    std::wstring dll = dir + L"\\" + base + L".dll", chain = dir + L"\\" + base + L"_chain.dll";
+    if (fileExists(dll) && isOurDll(dll)) {
+        if (!DeleteFileW(dll.c_str())) { message = std::wstring(L"Could not delete ") + base + L".dll (is the game running?)"; return false; }
+        removedAny = true;
+        if (fileExists(chain)) MoveFileW(chain.c_str(), dll.c_str());
+    }
+    return true;
+}
+
+bool install(const std::wstring& dir, std::wstring& message) {
+    std::wstring notes;
+    for (const wchar_t* base : kProxyNames)
+        if (!installOne(dir, base, message, notes)) return false;
     CreateDirectoryW((dir + L"\\vrm").c_str(), nullptr);
     message = L"RedFactionVRoid is installed in:\n" + dir +
               L"\n\n1. Copy your .vrm avatar files into the \"vrm\" folder there.\n"
-              L"2. Start the game, pause, and choose VRM SKIN (or press Y / V while paused, or F7 anywhere).\n\n"
-              L"Settings: RFVRoid.ini   Log: RFVRoid.log";
-    if (fileExists(chain)) message += L"\n\nYour previous dxgi.dll was kept as dxgi_chain.dll and is still loaded.";
+              L"2. Start the game. A \"REDFACTIONVROID ACTIVE\" banner appears at the top of the screen.\n"
+              L"3. Pause and choose VRM SKIN (or press Y / V while paused, or F7 anywhere).\n\n"
+              L"Settings: RFVRoid.ini   Log: RFVRoid.log" + notes;
     return true;
 }
 
 bool uninstall(const std::wstring& dir, std::wstring& message) {
-    std::wstring dxgi = dir + L"\\dxgi.dll", chain = dir + L"\\dxgi_chain.dll";
-    if (!fileExists(dxgi) || !isOurDll(dxgi)) { message = L"RedFactionVRoid is not installed in:\n" + dir; return false; }
-    if (!DeleteFileW(dxgi.c_str())) { message = L"Could not delete dxgi.dll (is the game running?)"; return false; }
-    if (fileExists(chain)) MoveFileW(chain.c_str(), dxgi.c_str());
+    bool removed = false;
+    for (const wchar_t* base : kProxyNames)
+        if (!uninstallOne(dir, base, removed, message)) return false;
+    if (!removed) { message = L"RedFactionVRoid is not installed in:\n" + dir; return false; }
     message = L"RedFactionVRoid was removed.\nYour vrm folder and RFVRoid.ini were left in place.";
     return true;
 }
@@ -243,7 +265,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (_wcsicmp(mode.c_str(), L"/install") == 0) ok = install(dir, message);
     else if (_wcsicmp(mode.c_str(), L"/uninstall") == 0) ok = uninstall(dir, message);
     else {
-        bool installed = fileExists(dir + L"\\dxgi.dll") && isOurDll(dir + L"\\dxgi.dll");
+        bool installed = (fileExists(dir + L"\\dxgi.dll") && isOurDll(dir + L"\\dxgi.dll")) ||
+                         (fileExists(dir + L"\\d3d11.dll") && isOurDll(dir + L"\\d3d11.dll"));
         int choice;
         if (installed) {
             choice = MessageBoxW(nullptr,
