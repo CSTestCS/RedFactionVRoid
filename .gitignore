@@ -1,0 +1,4 @@
+build*/
+/dist/
+*.vrm
+!tests/**/*.vrm
